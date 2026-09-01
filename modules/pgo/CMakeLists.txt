@@ -17,8 +17,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 find_package(GTSAM REQUIRED)
 # VTK 9.1 as packaged on Ubuntu declares a link interface on MPI::MPI_C without
 # find_package(MPI), so pulling PCL fails outright when MPI is absent. Nothing we
-# use touches VTK's MPI paths, so an empty target satisfies the reference. (The
-# ament packages sidestep this because pcl_conversions resolves PCL first.)
+# use touches VTK's MPI paths, so an empty target satisfies the reference.
 find_package(MPI QUIET)
 if(NOT TARGET MPI::MPI_C)
   add_library(MPI::MPI_C INTERFACE IMPORTED)

@@ -7,7 +7,7 @@
 #
 # Resolution order:
 #   1. Whatever find_package(GTSAM CONFIG) already finds (a prior manual
-#      install, one baked into a Docker image via CMAKE_PREFIX_PATH, etc).
+#      install exposed through CMAKE_PREFIX_PATH, etc.).
 #   2. A previously vendored build of GTSAM under BIEVR_GTSAM_VENDOR_PREFIX.
 #   3. Clone borglab/gtsam @ 4.2.0, build it with GTSAM_USE_SYSTEM_EIGEN=ON
 #      (required -- GTSAM's bundled Eigen does not match the one the rest of
@@ -17,7 +17,7 @@
 #
 # The vendor prefix defaults to a per-user cache directory so this works
 # without sudo; override -DBIEVR_GTSAM_VENDOR_PREFIX=... (e.g. to /usr/local
-# inside a Docker image already running as root) to share it system-wide.
+# such as /usr/local to share it system-wide.
 
 if(NOT DEFINED BIEVR_GTSAM_VENDOR_PREFIX)
   set(BIEVR_GTSAM_VENDOR_PREFIX "$ENV{HOME}/.cache/bievr-thirdparty/gtsam-4.2.0"

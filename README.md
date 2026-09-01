@@ -15,8 +15,6 @@
 
 <p align="center">
 <a href="https://github.com/ethz-asl/BIEVR-LIO/actions/workflows/build_20_04.yaml"><img src="https://shieldcn.dev/github/ethz-asl/BIEVR-LIO/ci.svg?workflow=build_20_04.yaml&label=ROS1%20Noetic&size=xs&variant=outline&mode=light" alt="Ubuntu 20.04 + ROS Noetic Build" /></a>
-<a href="https://github.com/ethz-asl/BIEVR-LIO/actions/workflows/build_22_04.yaml"><img src="https://shieldcn.dev/github/ethz-asl/BIEVR-LIO/ci.svg?workflow=build_22_04.yaml&label=ROS2%20Humble&size=xs&variant=outline&mode=light" alt="Ubuntu 22.04 + ROS Humble Build" /></a>
-<a href="https://github.com/ethz-asl/BIEVR-LIO/actions/workflows/build_24_04.yaml"><img src="https://shieldcn.dev/github/ethz-asl/BIEVR-LIO/ci.svg?workflow=build_24_04.yaml&label=ROS2%20Jazzy&size=xs&variant=outline&mode=light" alt="Ubuntu 24.04 + ROS Jazzy Build" /></a>
 </p>
 
 <p align="center">
@@ -35,9 +33,9 @@ Reliable odometry is essential for mobile robots as they increasingly enter more
 
 # Setup
 
-The core estimator (`bievr_lio`) is a self-contained, ROS-independent library. On
-top of it we provide both a **ROS1** interface (`bievr_lio_ros`) and a **ROS2**
-interface (`bievr_lio_ros2`), which live side by side under `interfaces/`.
+The core estimator (`bievr_lio`) is a self-contained, ROS-independent library.
+This repository provides a **ROS1 Noetic** interface (`bievr_lio_ros`) under
+`interfaces/ros1`.
 
 ## Installation
 
@@ -46,35 +44,6 @@ interface (`bievr_lio_ros2`), which live side by side under `interfaces/`.
 BIEVR-LIO is intentionally light on dependencies: the core estimator only needs
 **[Eigen](https://eigen.tuxfamily.org)** and **[Ceres](http://ceres-solver.org)**.
 
-
-Build instructions for both ROS versions are below. Each also offers an optional
-Docker image for quickly trying out the system without setting up dependencies.
-
-<details>
-<summary><b>ROS1</b></summary>
-<br>
-
-### For quick testing: Docker
-
-If you just want to try the system out without setting up dependencies, build the
-image and drop into a shell inside it:
-
-```bash
-cd docker/
-./run_docker_ros1.sh -b
-```
-
-The `-b` flag builds the image. On subsequent runs you can
-omit it to reuse the existing image. Your `~/data` folder is mounted to
-`/home/bievr/data` inside the container so you can keep datasets outside the
-image.
-
-To open another terminal inside the running container (e.g. to launch a node
-and play a bag):
-
-```bash
-docker exec -it BIEVR-LIO-ROS1 /bin/bash
-```
 
 ### Build
 
@@ -95,12 +64,7 @@ cd ~/catkin_ws/src
 git clone git@github.com:ethz-asl/BIEVR-LIO.git BIEVR-LIO
 ```
 
-Install the Ceres version used by BIEVR-LIO with the provided script (builds
-Ceres 2.2.0 from source):
-
-```bash
-sudo ./BIEVR-LIO/docker/scripts/install_ceres.sh
-```
+Make sure a compatible Ceres installation is available to CMake before building.
 
 (Optional) **Livox support.** The Livox `CustomMsg` branches are only compiled if
 the corresponding driver is found in the workspace at build time. Otherwise
@@ -122,79 +86,10 @@ cd ~/catkin_ws
 catkin build bievr_lio_ros
 source devel/setup.bash
 ```
-</details>
-
-<details>
-<summary><b>ROS2</b></summary>
-<br>
-
-### For quick testing: Docker
-
-If you just want to try the system out without setting up dependencies, build the
-image and drop into a shell inside it:
-
-```bash
-cd docker/
-./run_docker_ros2.sh -b
-```
-
-The `-b` flag builds the image. On subsequent runs you can
-omit it to reuse the existing image. Your `~/data` folder is mounted to
-`/home/bievr/data` inside the container.
-
-To open another terminal inside the running container (e.g. to launch a node
-and play a bag):
-
-```bash
-docker exec -it BIEVR-LIO-ROS2 /bin/bash
-```
-
-### Build
-
-Requires [ROS2 Jazzy](https://docs.ros.org/en/jazzy/Installation.html) and
-`python3-colcon-common-extensions`
-(`sudo apt install python3-colcon-common-extensions`). The system was tested on
-Jazzy, but other ROS2 distributions might also work.
-
-Create a colcon workspace and clone BIEVR-LIO into it:
-
-```bash
-mkdir -p ~/colcon_ws/src
-cd ~/colcon_ws/src
-git clone git@github.com:ethz-asl/BIEVR-LIO.git BIEVR-LIO
-```
-
-Install the Ceres version used by BIEVR-LIO with the provided script (builds
-Ceres 2.2.0 from source):
-
-```bash
-sudo ./BIEVR-LIO/docker/scripts/install_ceres.sh
-```
-
-(Optional) **Livox support.** The Livox `CustomMsg` branch is only compiled if
-`livox_ros_driver2` is found in the workspace at build time. Otherwise BIEVR-LIO
-builds fine without it. If you need to process Livox data, clone and build the
-driver into `~/colcon_ws/src` *before* building BIEVR-LIO (it also needs its
-Livox-SDK2 installed system-wide). Only gen2 exists for ROS2 (enables
-`BIEVR_WITH_LIVOX`):
-
-- [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2) +
-  [Livox-SDK2](https://github.com/Livox-SDK/Livox-SDK2)
-
-Build and source it (from the workspace root, so colcon picks up both `BIEVR/`,
-the core, and `interfaces/ros2`):
-
-```bash
-cd ~/colcon_ws
-source /opt/ros/jazzy/setup.bash
-colcon build --packages-up-to bievr_lio_ros2
-source install/setup.bash
-```
-</details>
 
 ## Run data
 
-BIEVR-LIO provides two entry points, available for both ROS versions:
+BIEVR-LIO provides two ROS1 entry points:
 
 - **`process_topics`** runs online: it subscribes to the LiDAR and IMU topics and
   processes messages as they arrive. Use it with a live sensor or alongside
@@ -205,10 +100,6 @@ BIEVR-LIO provides two entry points, available for both ROS versions:
 In the commands below, replace `<sensor_config>` with one of the provided configs
 (see [Configuration](#configuration)) or your own. Add `rviz:=true` to bring up
 the visualization.
-
-<details>
-<summary><b>ROS1</b></summary>
-<br>
 
 Process live topics:
 
@@ -221,24 +112,6 @@ Replay a rosbag:
 ```bash
 roslaunch bievr_lio_ros process_bag.launch sensor_config:=<sensor_config> rosbag:=/path/to/bag.bag
 ```
-</details>
-
-<details>
-<summary><b>ROS2</b></summary>
-<br>
-
-Process live topics:
-
-```bash
-ros2 launch bievr_lio_ros2 process_topics.launch.py sensor_config:=<sensor_config>
-```
-
-Replay a rosbag2 directory:
-
-```bash
-ros2 launch bievr_lio_ros2 process_bag.launch.py sensor_config:=<sensor_config> rosbag:=/path/to/bag_dir
-```
-</details>
 
 ## Configuration
 

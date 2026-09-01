@@ -2,8 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 project(bievr_ros_common VERSION 0.0.0 LANGUAGES CXX)
 
 # ---------------------------------------------------------------------------
-# Header-only library with the ROS-agnostic glue shared by the ROS1 and ROS2
-# wrappers, kept out of the core `bievr_lio` library so its include tree stays
+# Header-only library with glue shared by the ROS1 topic and bag nodes, kept
+# out of the core `bievr_lio` library so its include tree stays
 # free of any wrapper/interface code:
 #   - config_loader.h     : parses the shared YAML config into the core `Config`
 #   - conversions_impl.h  : templated ROS msg <-> LIO type conversions

@@ -1,23 +1,9 @@
 #ifndef BIEVR_ROS_COMMON_CONVERSIONS_H_
 #define BIEVR_ROS_COMMON_CONVERSIONS_H_
 
-// Shared message <-> LIO type conversions for both the ROS1 and ROS2 wrappers.
-// The ROS1 and ROS2 message structs expose identical field layouts, so the
-// conversions are written once here as templates. The handful of genuine
-// ROS1-vs-ROS2 differences are resolved generically with `if constexpr` over
-// feature-detection concepts:
-//   - header stamp -> ns/seconds: ros::Time has toNSec()/toSec(); the ROS2
-//     builtin_interfaces::msg::Time exposes .sec/.nanosec fields instead.
-//   - std_msgs/Header `seq`: present on ROS1 only.
-// The only conversions that can't be written generically are the Livox
-// CustomMsg overloads (at the bottom of this header): the two driver
-// generations are structurally identical so they can't be told apart
-// generically, and they disagree on which field holds the scan base stamp.
-//
-// Which distro's message headers to include is detected with __has_include, so
-// this single header serves both wrappers; a wrapper can override by predefining
-// BIEVR_ROS_COMMON_ROS1 / BIEVR_ROS_COMMON_ROS2 (e.g. if both distros are
-// installed on the include path).
+// ROS1 message <-> LIO type conversions shared by the topic and bag nodes.
+// Livox gen1 and gen2 overloads remain optional and are enabled only when the
+// matching ROS1 driver is available at build time.
 
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
@@ -27,7 +13,6 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
-#include <type_traits>
 #include <vector>
 
 #include "bievr_lio/common.h"
@@ -35,34 +20,7 @@
 #include "bievr_lio/timing.h"
 #include "bievr_lio/utils.h"
 
-// --- ROS version detection + message headers ------------------------------
-#if !defined(BIEVR_ROS_COMMON_ROS1) && !defined(BIEVR_ROS_COMMON_ROS2)
-#if __has_include(<rclcpp/rclcpp.hpp>)
-#define BIEVR_ROS_COMMON_ROS2
-#elif __has_include(<ros/ros.h>)
-#define BIEVR_ROS_COMMON_ROS1
-#else
-#error \
-    "bievr_ros_common/conversions.h: found neither ROS2 (<rclcpp/rclcpp.hpp>) nor ROS1 (<ros/ros.h>)"
-#endif
-#endif
-
-#ifdef BIEVR_ROS_COMMON_ROS2
-#include <geometry_msgs/msg/point.hpp>
-#include <geometry_msgs/msg/pose.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <geometry_msgs/msg/transform.hpp>
-#include <geometry_msgs/msg/vector3.hpp>
-#include <nav_msgs/msg/odometry.hpp>
-#include <nav_msgs/msg/path.hpp>
-#include <sensor_msgs/msg/imu.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
-#include <std_msgs/msg/header.hpp>
-#ifdef BIEVR_WITH_LIVOX
-#include <livox_ros_driver2/msg/custom_msg.hpp>
-#endif
-#else  // BIEVR_ROS_COMMON_ROS1
+// --- ROS1 message headers --------------------------------------------------
 #include <geometry_msgs/Point.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/Transform.h>
@@ -76,7 +34,6 @@
 #endif
 #ifdef BIEVR_WITH_LIVOX2
 #include <livox_ros_driver2/CustomMsg.h>
-#endif
 #endif
 
 namespace bievr {
@@ -111,17 +68,6 @@ concept TransformLike = requires(T m) {
   m.rotation;
 };
 
-// Stamp/header API differences between ROS1 (ros::Time, std_msgs/Header with
-// `seq`) and ROS2 (builtin_interfaces::msg::Time with .sec/.nanosec, no `seq`).
-template <typename T>
-concept HasToNSec = requires(const T& t) { t.toNSec(); };
-template <typename T>
-concept HasToSec = requires(const T& t) { t.toSec(); };
-template <typename T>
-concept HasFromNSec = requires(T& t) { t.fromNSec(std::uint64_t{}); };
-template <typename T>
-concept HasSeq = requires(T& t) { t.seq; };
-
 // Reads a scalar of type T from a (possibly unaligned) byte address.
 template <typename T>
 inline T readAt(const uint8_t* p) {
@@ -144,26 +90,16 @@ const FieldT* findField(const std::vector<FieldT>& fields, const std::string& na
   return it == fields.cend() ? nullptr : &*it;
 }
 
-// Header stamp -> nanoseconds since epoch, for either ROS version.
+// ROS1 header stamp -> nanoseconds since epoch.
 template <typename StampT>
 inline uint64_t stampToNs(const StampT& stamp) {
-  if constexpr (HasToNSec<StampT>) {
-    return static_cast<uint64_t>(stamp.toNSec());  // ros::Time
-  } else {
-    return static_cast<uint64_t>(stamp.sec) * 1'000'000'000ULL +
-           static_cast<uint64_t>(stamp.nanosec);  // builtin_interfaces::msg::Time
-  }
+  return static_cast<uint64_t>(stamp.toNSec());
 }
 
-// Header stamp -> seconds since epoch, for either ROS version.
+// ROS1 header stamp -> seconds since epoch.
 template <typename StampT>
 inline double stampToS(const StampT& stamp) {
-  if constexpr (HasToSec<StampT>) {
-    return stamp.toSec();  // ros::Time
-  } else {
-    return static_cast<double>(stamp.sec) +
-           static_cast<double>(stamp.nanosec) * 1e-9;  // builtin_interfaces::msg::Time
-  }
+  return stamp.toSec();
 }
 
 // Livox CustomMsg -> StampedIntensityPointcloud. `base_stamp_ns` is the scan
@@ -488,17 +424,9 @@ void pointCloudToMsg(const IntensityPointcloud& pointcloud, PointCloud2T& pointc
 
 template <typename HeaderMsgT>
 void headerToMsg(const Header& header, HeaderMsgT& header_msg) {
-  using StampT = std::remove_reference_t<decltype(header_msg.stamp)>;
-  if constexpr (conv_detail::HasFromNSec<StampT>) {
-    header_msg.stamp.fromNSec(header.stamp);  // ros::Time
-  } else {
-    header_msg.stamp.sec = static_cast<std::int32_t>(header.stamp / 1'000'000'000ULL);
-    header_msg.stamp.nanosec = static_cast<std::uint32_t>(header.stamp % 1'000'000'000ULL);
-  }
+  header_msg.stamp.fromNSec(header.stamp);
   header_msg.frame_id = header.frame;
-  if constexpr (conv_detail::HasSeq<HeaderMsgT>) {
-    header_msg.seq = header.seq;  // ROS1 std_msgs/Header only
-  }
+  header_msg.seq = header.seq;
 }
 
 // Transform -> geometry_msgs/Pose (position + orientation).
@@ -557,48 +485,15 @@ void vecToMsg(const V3& vec, Vec3MsgT& msg) {
   msg.z = vec.z();
 }
 
-// Livox CustomMsg -> StampedIntensityPointcloud. The only per-distro overloads:
-// the gen1/gen2 messages are structurally identical (so they can't be told apart
-// generically) and disagree on the scan base-stamp field (gen1: header stamp;
-// gen2: `timebase`, falling back to the header stamp when it is not host time).
-// Gated by the BIEVR_WITH_LIVOX[2] compile definitions.
-#ifdef BIEVR_ROS_COMMON_ROS2
-#ifdef BIEVR_WITH_LIVOX  // ROS2 has only the gen2 driver (livox_ros_driver2)
-inline bool msgToPointcloud(const livox_ros_driver2::msg::CustomMsg& pointcloud_msg,
-                            StampedIntensityPointcloud& stamped_pointcloud) {
-  // `timebase` is on the host clock only when the sensor is time-synced; otherwise it is a raw
-  // device counter (e.g. bags converted from the gen1 driver, where it holds sensor uptime). The
-  // header stamp is always host time, so use it as the reference and fall back to it when the two
-  // disagree - the synchronizer compares this stamp against IMU stamps, which are host time.
-  constexpr uint64_t kMaxTimebaseSkewNs = 1'000'000'000ULL;
-  const uint64_t header_ns = conv_detail::stampToNs(pointcloud_msg.header.stamp);
-  const uint64_t timebase_ns = pointcloud_msg.timebase;
-  const uint64_t skew =
-      timebase_ns > header_ns ? timebase_ns - header_ns : header_ns - timebase_ns;
-
-  uint64_t base_stamp_ns = timebase_ns;
-  if (skew >= kMaxTimebaseSkewNs) {
-    LOG_FIRST(W, 1,
-              "Livox `timebase` " << timebase_ns << " disagrees with header stamp " << header_ns
-                                  << " by " << nsToS(skew)
-                                  << " s; the sensor is likely not time-synced. Using the header "
-                                     "stamp as the scan base.");
-    base_stamp_ns = header_ns;
-  }
-
-  return conv_detail::livoxToStampedIntensity(pointcloud_msg, base_stamp_ns,
-                                              "00_conversion_livox2", stamped_pointcloud);
-}
-#endif
-#else                    // BIEVR_ROS_COMMON_ROS1
-#ifdef BIEVR_WITH_LIVOX  // gen1: base stamp in the message header
+// ROS1 Livox CustomMsg -> StampedIntensityPointcloud.
+#ifdef BIEVR_WITH_LIVOX  // gen1：基准时间位于消息头
 inline bool msgToPointcloud(const livox_ros_driver::CustomMsg& pointcloud_msg,
                             StampedIntensityPointcloud& stamped_pointcloud) {
   return conv_detail::livoxToStampedIntensity(pointcloud_msg, pointcloud_msg.header.stamp.toNSec(),
                                               "00_conversion_livox", stamped_pointcloud);
 }
 #endif
-#ifdef BIEVR_WITH_LIVOX2  // gen2: base stamp in `timebase`
+#ifdef BIEVR_WITH_LIVOX2  // gen2：基准时间位于 timebase
 inline bool msgToPointcloud(const livox_ros_driver2::CustomMsg& pointcloud_msg,
                             StampedIntensityPointcloud& stamped_pointcloud) {
   // `timebase` is on the host clock only when the sensor is time-synced; otherwise it is a raw
@@ -624,7 +519,6 @@ inline bool msgToPointcloud(const livox_ros_driver2::CustomMsg& pointcloud_msg,
   return conv_detail::livoxToStampedIntensity(pointcloud_msg, base_stamp_ns,
                                               "00_conversion_livox2", stamped_pointcloud);
 }
-#endif
 #endif
 
 }  // namespace bievr

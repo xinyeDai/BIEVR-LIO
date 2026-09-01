@@ -2,9 +2,8 @@
 #define BIEVR_LIO_CONFIG_LOADER_H_
 
 // Single source of truth for the wrapper configuration. This header is
-// ROS-agnostic: it reads plain YAML files via yaml-cpp and fills `Config`, so
-// the ROS1 and ROS2 wrappers share one loader and one set of YAML config files.
-// The ROS layer only carries the *paths* of the files to load.
+// ROS-independent: it reads plain YAML files via yaml-cpp and fills `Config`.
+// The ROS1 layer only carries the *paths* of the files to load.
 //
 // The YAML is organised into sections (topics / calibration / lidar / imu /
 // map / preprocess / optimization / debug). Files are
@@ -361,10 +360,10 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
 
 // Loads `Config` from the executable's command-line arguments (the launch file
 // passes the YAML paths as argv rather than ROS parameters, so this is fully
-// ROS-agnostic and shared by both wrappers). Recognised flags:
+// independent of ROS message types). Recognised flags:
 //   --sensor_config_file <path>   --params_file <path>   --bag <path>
 // `args` is the argument list with any ROS-specific arguments already stripped
-// (ros::init does this in place on ROS1; rclcpp::remove_ros_arguments on ROS2).
+// (`ros::init` does this in place on ROS1).
 inline bool loadConfigFromArgs(const std::vector<std::string>& args, Config& config) {
   std::string sensor_config_file;
   // Repeatable, so a launch file can layer a small overlay on top of the shared

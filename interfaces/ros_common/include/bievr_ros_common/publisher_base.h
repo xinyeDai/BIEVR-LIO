@@ -1,14 +1,11 @@
 #ifndef BIEVR_ROS_COMMON_PUBLISHER_BASE_H_
 #define BIEVR_ROS_COMMON_PUBLISHER_BASE_H_
 
-// ROS-version-agnostic publisher logic shared by the ROS1 and ROS2 wrappers.
-// Everything that genuinely differs between the two (the node handle, the
-// type-erased publisher mechanism, the concrete message types and the TF
-// broadcaster) is supplied by a `Backend` policy; the dispatch, lazy
-// advertising, namespace handling and pipeline registration live here once.
+// ROS1 topic and bag nodes share this publisher implementation. The concrete
+// node handle, publisher types and TF broadcaster are supplied by a Backend.
 //
 // The message conversions (headerToMsg / pointCloudToMsg / transformToMsg /
-// vecToMsg) are the version-agnostic templates from conversions.h, included
+// vecToMsg) are the shared templates from conversions.h, included
 // below so they resolve by ordinary lookup at this template's definition. They
 // build PointCloud2 messages via sensor_msgs::PointCloud2Modifier, so the TU
 // that instantiates a Publisher must have included the matching
