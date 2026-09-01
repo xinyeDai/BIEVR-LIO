@@ -1,0 +1,98 @@
+#ifndef BIEVR_LOCALIZATION_CONFIG_LOADER_H_
+#define BIEVR_LOCALIZATION_CONFIG_LOADER_H_
+
+// Parses the `localization:` section of the same YAML files bievr_lio loads, so
+// the module configures itself without the core knowing it exists. Header-only;
+// consumers need yaml-cpp on their include path (as with bievr_lio's loader).
+
+#include <bievr_lio/config_loader.h>
+
+#include <string>
+#include <vector>
+
+#include "bievr_localization/localizer.h"
+
+namespace bievr {
+
+struct LocalizationConfig {
+  bool enable = false;
+  Localizer::Config localizer;
+  double publish_frequency = 50.0;  // Hz, the map->odom + fused pose broadcast
+  // The prior map has no publish rate: it goes out when the resident set
+  // changes and not otherwise. See Localization::publishMap.
+
+  // Localized trajectory. One pose per odometry frame; the whole path is resent
+  // each tick, so cap it on a long run rather than raising the rate.
+  bool publish_path = true;
+  double path_publish_frequency = 10.0;  // Hz
+  size_t path_max_poses = 0;             // 0 = unlimited, oldest dropped once reached
+};
+
+inline bool loadLocalizationConfig(const std::vector<std::string>& yaml_paths,
+                                   LocalizationConfig& config) {
+  config_internal::MergedYaml yaml;
+  for (const std::string& path : yaml_paths) {
+    if (path.empty()) continue;
+    try {
+      yaml.add(YAML::LoadFile(path));
+    } catch (const std::exception& e) {
+      LOG(E, "Failed to load YAML config '" << path << "': " << e.what());
+      return false;
+    }
+  }
+
+  const std::string s = "localization";
+  auto& c = config.localizer;
+
+  config.enable = yaml.get<bool>(s, "enable", config.enable);
+  if (!config.enable) return true;
+
+  c.map_path = yaml.get<std::string>(s, "map_path", c.map_path);
+  c.map_frame = yaml.get<std::string>(s, "map_frame", c.map_frame);
+  c.map_voxel_size_m = yaml.get<double>(s, "map_voxel_size_m", c.map_voxel_size_m);
+  c.map_viz_voxel_size_m = yaml.get<double>(s, "map_viz_voxel_size_m", c.map_viz_voxel_size_m);
+  c.scan_voxel_size_m = yaml.get<double>(s, "scan_voxel_size_m", c.scan_voxel_size_m);
+  c.tile_size_m = yaml.get<double>(s, "tile_size_m", c.tile_size_m);
+  c.crop_radius_m = yaml.get<double>(s, "crop_radius_m", c.crop_radius_m);
+  c.correction_frequency = yaml.get<double>(s, "correction_frequency", c.correction_frequency);
+
+  c.icp_max_correspondence_distance =
+      yaml.get<double>(s, "icp_max_correspondence_distance", c.icp_max_correspondence_distance);
+  c.icp_max_iterations = yaml.get<int>(s, "icp_max_iterations", c.icp_max_iterations);
+  c.icp_transformation_epsilon =
+      yaml.get<double>(s, "icp_transformation_epsilon", c.icp_transformation_epsilon);
+  c.fitness_threshold = yaml.get<double>(s, "fitness_threshold", c.fitness_threshold);
+  c.gicp_num_neighbors = yaml.get<int>(s, "gicp_num_neighbors", c.gicp_num_neighbors);
+  c.gicp_num_threads = yaml.get<int>(s, "gicp_num_threads", c.gicp_num_threads);
+  c.gicp_max_translation_step_m =
+      yaml.get<double>(s, "gicp_max_translation_step_m", c.gicp_max_translation_step_m);
+  c.gicp_max_rotation_step_deg =
+      yaml.get<double>(s, "gicp_max_rotation_step_deg", c.gicp_max_rotation_step_deg);
+
+  auto& sc = c.scan_context;
+  sc.num_candidates = yaml.get<int>(s, "sc_num_candidates", sc.num_candidates);
+  sc.search_ratio = yaml.get<double>(s, "sc_search_ratio", sc.search_ratio);
+  sc.dist_threshold = yaml.get<double>(s, "sc_dist_threshold", sc.dist_threshold);
+  // num_exclude_recent is a mapping-side notion: relocalization searches the
+  // whole database, so it is deliberately not exposed here.
+  c.use_sc_yaw_guess = yaml.get<bool>(s, "use_sc_yaw_guess", c.use_sc_yaw_guess);
+  c.max_consecutive_failures =
+      yaml.get<int>(s, "max_consecutive_failures", c.max_consecutive_failures);
+
+  config.publish_frequency = yaml.get<double>(s, "publish_frequency", config.publish_frequency);
+  config.publish_path = yaml.get<bool>(s, "publish_path", config.publish_path);
+  config.path_publish_frequency =
+      yaml.get<double>(s, "path_publish_frequency", config.path_publish_frequency);
+  const int max_poses = yaml.get<int>(s, "path_max_poses", static_cast<int>(config.path_max_poses));
+  if (max_poses < 0) {
+    LOG(E, "Config error: 'localization.path_max_poses' must be >= 0 (0 = unlimited), got "
+               << max_poses << ".");
+    return false;
+  }
+  config.path_max_poses = static_cast<size_t>(max_poses);
+  return true;
+}
+
+}  // namespace bievr
+
+#endif  // BIEVR_LOCALIZATION_CONFIG_LOADER_H_

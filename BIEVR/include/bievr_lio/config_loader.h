@@ -42,6 +42,9 @@ struct Config {
   // Upper bound on threads used for TBB parallel regions. 0 = let TBB decide
   // (use all available cores); >0 caps parallelism to that many threads.
   int max_num_threads = 0;
+  // Files this config was loaded from, in override order. Optional modules parse
+  // their own sections from the same files without re-deriving the paths.
+  std::vector<std::string> yaml_paths;
 };
 
 namespace config_internal {
@@ -168,6 +171,16 @@ inline void printConfigOverview(const Config& config) {
   os << "  t_init:               " << hc.imu.t_init << "\n";
   os << "  normalized:           " << hc.imu.normalized << "\n";
   os << "  frame:                " << hc.body_frame << "\n";
+  os << "path:\n";
+  os << "  publish:              " << yn(hc.publish_path) << "\n";
+  os << "  max_poses:            "
+     << (hc.max_path_poses > 0 ? std::to_string(hc.max_path_poses) : std::string("unlimited"))
+     << "\n";
+  os << "map_save:\n";
+  os << "  accumulate:           " << yn(hc.accumulate_map) << "\n";
+  os << "  resolution_m:         " << hc.map_save_resolution << "\n";
+  os << "  path:                 "
+     << (hc.map_save_path.empty() ? "<cwd>/bievr_map.pcd" : hc.map_save_path) << "\n";
   os << "debug:\n";
   os << "  publish_all_clouds:        " << yn(hc.publish_all_clouds) << "\n";
   os << "  print_timing:         " << yn(hc.print_timing) << "\n";
@@ -202,6 +215,7 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
       LOG(E, "Failed to load YAML config '" << path << "': " << e.what());
       return false;
     }
+    config.yaml_paths.push_back(path);
   }
 
   auto& tc = config.topic_config;
@@ -257,6 +271,26 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
   // The IMU frame is the body (child) frame of the published odometry.
   hc.body_frame = yaml.get<std::string>("imu", "frame", hc.body_frame);
 
+  // --- path (published trajectory) ---
+  hc.publish_path = yaml.get<bool>("path", "publish", true);
+  // Unlike the resolutions above, 0 is meaningful here (unlimited), so this is
+  // checked for negativity rather than run through getPositive().
+  const int max_path_poses = yaml.get<int>("path", "max_poses", 10000);
+  if (max_path_poses < 0) {
+    LOG(E, "Config error: 'path.max_poses' must be >= 0 (0 = unlimited), got " << max_path_poses
+                                                                               << ".");
+    return false;
+  }
+  hc.max_path_poses = static_cast<size_t>(max_path_poses);
+
+  // --- map saving (accumulated registered scans, written by the save service) ---
+  hc.accumulate_map = yaml.get<bool>("map_save", "accumulate", true);
+  hc.map_save_path = yaml.get<std::string>("map_save", "path", "");
+  if (!config_internal::getPositive(yaml, "map_save", "resolution_m", 0.1,
+                                    hc.map_save_resolution)) {
+    return false;
+  }
+
   // --- debug ---
   hc.publish_all_clouds = yaml.get<bool>("debug", "publish_all_clouds", false);
   hc.print_timing = yaml.get<bool>("debug", "timing", false);
@@ -266,27 +300,40 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
   // --- dashboard (live status print) ---
   hc.print_dashboard = yaml.get<bool>("debug", "dashboard", false);
   hc.dashboard_ascii_path = yaml.get<std::string>("debug", "dashboard_ascii_path", "");
-  // If the dashboard is enabled but no explicit art path is given, look for
-  // `bievr_ascii.txt` next to the config files that were loaded. Those files may
-  // live in different directories (e.g. params.yaml in config/, the sensor
-  // config in config/sensor_configs/), so probe each config's directory and its
-  // parent and take the first that actually contains the file rather than
-  // guessing a path that may not exist.
-  if (hc.print_dashboard && hc.dashboard_ascii_path.empty()) {
+  // Resolve the art file. An absolute path is taken verbatim; a bare name (or no
+  // name at all, which means `bievr_ascii.txt`) is looked for in the working
+  // directory and then next to the config files that were loaded. Those may live
+  // in different directories -- params.yaml in config/, the sensor config in
+  // config/sensor_configs/ -- so probe each config's directory and its parent and
+  // take the first that actually contains the file rather than guessing a path
+  // that may not exist.
+  if (hc.print_dashboard) {
     namespace fs = std::filesystem;
-    for (const std::string& p : yaml_paths) {
-      if (p.empty()) continue;
-      const fs::path dir = fs::path(p).parent_path();
-      for (const fs::path& candidate_dir : {dir, dir.parent_path()}) {
-        const fs::path candidate = candidate_dir / "bievr_ascii.txt";
-        std::error_code ec;
-        if (fs::exists(candidate, ec)) {
-          hc.dashboard_ascii_path = candidate.string();
-          break;
+    const bool named = !hc.dashboard_ascii_path.empty();
+    const fs::path requested =
+        named ? fs::path(hc.dashboard_ascii_path) : fs::path("bievr_ascii.txt");
+
+    hc.dashboard_ascii_path.clear();
+    std::error_code ec;
+    if (requested.is_absolute() || fs::exists(requested, ec)) {
+      hc.dashboard_ascii_path = requested.string();
+    } else {
+      for (const std::string& p : yaml_paths) {
+        if (p.empty()) continue;
+        const fs::path dir = fs::path(p).parent_path();
+        for (const fs::path& candidate_dir : {dir, dir.parent_path()}) {
+          const fs::path candidate = candidate_dir / requested;
+          if (fs::exists(candidate, ec)) {
+            hc.dashboard_ascii_path = candidate.string();
+            break;
+          }
         }
+        if (!hc.dashboard_ascii_path.empty()) break;
       }
-      if (!hc.dashboard_ascii_path.empty()) break;
     }
+    // Keep a name the user actually asked for even when it was not found, so the
+    // pipeline reports it instead of silently dropping the art.
+    if (hc.dashboard_ascii_path.empty() && named) hc.dashboard_ascii_path = requested.string();
   }
 
   // Lower the log level so DEBUG messages are shown when requested, otherwise
@@ -320,7 +367,9 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
 // (ros::init does this in place on ROS1; rclcpp::remove_ros_arguments on ROS2).
 inline bool loadConfigFromArgs(const std::vector<std::string>& args, Config& config) {
   std::string sensor_config_file;
-  std::string params_file;
+  // Repeatable, so a launch file can layer a small overlay on top of the shared
+  // params instead of having to copy and patch the whole file.
+  std::vector<std::string> params_files;
   std::string bag_path;
   bool have_bag = false;
 
@@ -335,7 +384,8 @@ inline bool loadConfigFromArgs(const std::vector<std::string>& args, Config& con
     if (args[i] == "--sensor_config_file") {
       sensor_config_file = value("--sensor_config_file");
     } else if (args[i] == "--params_file") {
-      params_file = value("--params_file");
+      const std::string path = value("--params_file");
+      if (!path.empty()) params_files.push_back(path);
     } else if (args[i] == "--bag") {
       bag_path = value("--bag");
       have_bag = true;
@@ -344,9 +394,11 @@ inline bool loadConfigFromArgs(const std::vector<std::string>& args, Config& con
     }
   }
 
-  // Later files override earlier ones: params first, then sensor config, so the
-  // sensor file wins on any leaf the two files share.
-  if (!loadConfigFromYaml({params_file, sensor_config_file}, config)) {
+  // Later files override earlier ones: params in the order given, then sensor
+  // config, so the sensor file wins on any leaf it shares with them.
+  std::vector<std::string> paths = params_files;
+  paths.push_back(sensor_config_file);
+  if (!loadConfigFromYaml(paths, config)) {
     return false;
   }
   // The bag path is a launch argument, not part of the shared YAML config; only

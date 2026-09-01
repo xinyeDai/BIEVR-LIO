@@ -35,6 +35,7 @@ add_library(${PROJECT_NAME}
   src/imu_integrator.cpp
   src/inertial_factor.cpp
   src/ls_optimizer.cpp
+  src/map_accumulator.cpp
   src/preprocess.cpp
   src/prior_factor.cpp
   src/synchronizer.cpp
@@ -58,6 +59,12 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 target_compile_options(${PROJECT_NAME} PRIVATE
   $<$<CXX_COMPILER_ID:GNU>:-fconcepts>
   $<$<CONFIG:Release>:-O3>
+)
+# The installed GTSAM 4.0.3 and Ubuntu's PCL export -march=native. Propagate the
+# same Eigen ABI from the core so fixed-size Eigen members keep one layout in
+# every shared library and ROS executable.
+target_compile_options(${PROJECT_NAME} PUBLIC
+  $<$<CXX_COMPILER_ID:GNU>:-march=native>
 )
 
 # Route all logging through log++ (include/bievr_lio/log++.h) in LPP mode. PUBLIC

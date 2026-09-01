@@ -20,6 +20,10 @@
   <depend>std_msgs</depend>
   <depend>tf</depend>
   <depend>tf_conversions</depend>
+  <depend>pcl_conversions</depend>
+  <depend>std_srvs</depend>
+  <depend>bievr_pgo</depend>
+  <depend>bievr_localization</depend>
 
   <!-- Optional: Livox CustomMsg branches are only built if these drivers are
        available. livox_ros_driver = gen1, livox_ros_driver2 = gen2. -->

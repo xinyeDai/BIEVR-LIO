@@ -8,7 +8,9 @@
 #include <tbb/task_arena.h>
 
 #include "bievr_lio/config_loader.h"
+#include "bievr_lio_ros/loop_closure.h"
 #include "bievr_lio_ros/publisher.h"
+#include "bievr_lio_ros/save_map_service.h"
 #include "bievr_ros_common/conversions.h"
 #ifdef BIEVR_WITH_LIVOX
 #include <livox_ros_driver/CustomMsg.h>
@@ -23,6 +25,7 @@ int main(int argc, char** argv) {
   // argv in place, leaving our config-file flags for loadConfigFromArgs.
   ros::init(argc, argv, "bievr_lio_bag_node");
   ros::NodeHandle nh;
+  ros::NodeHandle private_nh("~");
 
   bievr::Config config;
   if (!bievr::loadConfigFromArgs({argv, argv + argc}, config)) {
@@ -42,6 +45,15 @@ int main(int argc, char** argv) {
   bievr::Synchronizer synchronizer(pipeline);
 
   bievr::Publisher lio_pub(nh, pipeline, "bievr_lio");
+  bievr::SaveMapService save_map_service(private_nh, pipeline);
+  bievr::LoopClosureConfig loop_config;
+  if (!bievr::loadLoopClosureConfig(config.yaml_paths, loop_config)) return -1;
+  private_nh.param("loop_closure_enable", loop_config.enable, loop_config.enable);
+  private_nh.param("bundle_path", loop_config.bundle_path, loop_config.bundle_path);
+  std::unique_ptr<bievr::LoopClosure> loop_closure;
+  if (loop_config.enable) {
+    loop_closure.reset(new bievr::LoopClosure(nh, private_nh, pipeline, loop_config, "bievr_lio"));
+  }
   rosbag::Bag bag;
   bag.open(config.topic_config.bag_path, rosbag::bagmode::Read);
   std::vector<std::string> topics = {config.topic_config.pointcloud_topic,
@@ -81,11 +93,33 @@ int main(int argc, char** argv) {
       bievr::msgToImuMeasurement(*s, imu);
       synchronizer.addImu(imu);
     }
+    ros::spinOnce();
   }
 
   LOG(I, "Done with for loop.");
   bag.close();
   LOG(I, "Bag closed");
+
+  if (loop_closure && !loop_closure->bundlePath().empty()) {
+    ros::Rate wait_rate(10.0);
+    int idle_polls = 0;
+    while (ros::ok() && idle_polls < 10) {
+      ros::spinOnce();
+      idle_polls = loop_closure->idle() ? idle_polls + 1 : 0;
+      wait_rate.sleep();
+    }
+    std::string message;
+    const auto stats = loop_closure->stats();
+    LOG(I, "Loop closure summary: " << stats.num_keyframes << " keyframes, "
+                                     << stats.num_loops << " accepted loops, "
+                                     << stats.num_rejected << " rejected candidates, "
+                                     << stats.dropped_frames << " dropped keyframes.");
+    if (!loop_closure->saveBundle(&message)) {
+      LOG(E, "Failed to save loop-closed map bundle: " << message);
+      return -1;
+    }
+    LOG(I, message);
+  }
 
   return 0;
 }

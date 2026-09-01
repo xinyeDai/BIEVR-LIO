@@ -19,6 +19,8 @@ find_package(catkin REQUIRED COMPONENTS
   tf
   tf_conversions
   rosbag
+  pcl_conversions
+  std_srvs
 )
 find_package(TBB REQUIRED)
 find_package(yaml-cpp REQUIRED)  # shared config_loader.h parses plain YAML files
@@ -27,6 +29,8 @@ find_package(yaml-cpp REQUIRED)  # shared config_loader.h parses plain YAML file
 # and link their exported targets explicitly.
 find_package(bievr_lio REQUIRED)
 find_package(bievr_ros_common REQUIRED)
+find_package(bievr_pgo REQUIRED)
+find_package(bievr_localization REQUIRED)
 
 # Livox support is optional: the Livox CustomMsg branches are only compiled when
 # the corresponding driver is on the system. Users without the drivers can still
@@ -56,12 +60,13 @@ catkin_package(
     tf
     tf_conversions
     rosbag
+    pcl_conversions
+    std_srvs
 )
 
 include_directories(
   include
   ${catkin_INCLUDE_DIRS}
-  ${YAML_CPP_INCLUDE_DIR}
 )
 
 # The wrapper is now header-only apart from the two executables (conversions,
@@ -78,6 +83,8 @@ foreach(target process_topics process_bag)
     ${catkin_LIBRARIES}
     bievr_lio::bievr_lio
     bievr_ros_common::bievr_ros_common
+    bievr_pgo::bievr_pgo
+    bievr_localization::bievr_localization
     ${YAML_CPP_LIBRARIES}
     TBB::tbb
   )

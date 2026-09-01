@@ -6,7 +6,10 @@
 #include <topic_tools/shape_shifter.h>
 
 #include "bievr_lio/config_loader.h"
+#include "bievr_lio_ros/localization.h"
+#include "bievr_lio_ros/loop_closure.h"
 #include "bievr_lio_ros/publisher.h"
+#include "bievr_lio_ros/save_map_service.h"
 #include "bievr_ros_common/conversions.h"
 #ifdef BIEVR_WITH_LIVOX
 #include <livox_ros_driver/CustomMsg.h>
@@ -21,6 +24,7 @@ int main(int argc, char** argv) {
   // argv in place, leaving our config-file flags for loadConfigFromArgs.
   ros::init(argc, argv, "bievr_lio_topic_node");
   ros::NodeHandle nh;
+  ros::NodeHandle private_nh("~");
 
   bievr::Config config;
   if (!bievr::loadConfigFromArgs({argv, argv + argc}, config)) {
@@ -38,6 +42,36 @@ int main(int argc, char** argv) {
       std::make_shared<bievr::Pipeline>(config.pipeline_config);
   bievr::Synchronizer synchronizer(pipeline);
   bievr::Publisher lio_pub(nh, pipeline, "bievr_lio");
+  bievr::SaveMapService save_map_service(private_nh, pipeline);
+
+  bievr::LoopClosureConfig loop_config;
+  if (!bievr::loadLoopClosureConfig(config.yaml_paths, loop_config)) return -1;
+  private_nh.param("loop_closure_enable", loop_config.enable, loop_config.enable);
+  private_nh.param("bundle_path", loop_config.bundle_path, loop_config.bundle_path);
+  std::unique_ptr<bievr::LoopClosure> loop_closure;
+  if (loop_config.enable) {
+    loop_closure.reset(new bievr::LoopClosure(nh, private_nh, pipeline, loop_config, "bievr_lio"));
+  }
+
+  bievr::LocalizationConfig localization_config;
+  if (!bievr::loadLocalizationConfig(config.yaml_paths, localization_config)) return -1;
+  private_nh.param("localization_enable", localization_config.enable, localization_config.enable);
+  private_nh.param("map_path", localization_config.localizer.map_path,
+                   localization_config.localizer.map_path);
+  std::unique_ptr<bievr::Localization> localization;
+  if (localization_config.enable) {
+    if (loop_config.enable) {
+      LOG(E, "loop_closure and localization cannot be enabled at the same time.");
+      return -1;
+    }
+    localization.reset(
+        new bievr::Localization(nh, pipeline, localization_config, "bievr_lio"));
+    std::string message;
+    if (!localization->start(&message)) {
+      LOG(E, "Failed to start localization: " << message);
+      return -1;
+    }
+  }
 
   ros::Subscriber pointcloud_sub = nh.subscribe<topic_tools::ShapeShifter>(
       config.topic_config.pointcloud_topic, 100000,
@@ -97,6 +131,8 @@ int main(int argc, char** argv) {
         synchronizer.addImu(imu);
       });
 
+  // Keep LiDAR and IMU callbacks serialized. Loop detection, optimization and
+  // localization ICP have their own worker threads inside the core modules.
   ros::spin();
 
   return 0;

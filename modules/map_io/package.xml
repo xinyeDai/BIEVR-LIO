@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>bievr_map_io</name>
+  <version>0.0.0</version>
+  <description>Reads and writes the prior map localization runs against: a bare PCD, or a bundle that adds a Scan Context database and its keyframe poses</description>
+
+  <maintainer email="ihebtn5@gmail.com">soula</maintainer>
+
+  <license>TODO</license>
+
+  <buildtool_depend>cmake</buildtool_depend>
+
+  <depend>bievr_lio</depend>
+  <depend>bievr_scancontext</depend>
+
+  <export>
+    <build_type>cmake</build_type>
+  </export>
+</package>
