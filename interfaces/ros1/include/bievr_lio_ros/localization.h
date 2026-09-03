@@ -13,6 +13,9 @@
 #include <std_msgs/String.h>
 #include <tf/transform_broadcaster.h>
 
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -62,6 +65,55 @@ class Localization {
   Localizer::Status status() const { return localizer_->status(); }
   Localizer::Stats stats() const { return localizer_->stats(); }
   bool canRelocalize() const { return localizer_->canRelocalize(); }
+
+  // Saves the map-frame trajectory published on /loc/path in TUM format. The
+  // output is placed beside the configured map bundle (normally Log/).
+  bool saveTrajectory(std::string* message = nullptr) {
+    namespace fs = std::filesystem;
+    const fs::path map_path(config_.localizer.map_path);
+    const fs::path output_dir =
+        map_path.has_parent_path() ? map_path.parent_path() : fs::path("Log");
+    const fs::path output_path = output_dir / "localization_tum.txt";
+
+    Path snapshot;
+    {
+      std::lock_guard<std::mutex> lock(path_mutex_);
+      snapshot = trajectory_;
+    }
+    if (snapshot.poses.empty()) {
+      if (message) *message = "No localized poses accumulated; localization trajectory not saved.";
+      return false;
+    }
+
+    std::error_code ec;
+    fs::create_directories(output_dir, ec);
+    if (ec) {
+      if (message) *message = "Failed to create localization log directory: " + ec.message();
+      return false;
+    }
+
+    std::ofstream out(output_path);
+    if (!out) {
+      if (message) *message = "Failed to open '" + output_path.string() + "'.";
+      return false;
+    }
+    out << std::fixed << std::setprecision(9);
+    for (const auto& stamped : snapshot.poses) {
+      const V3& p = stamped.pose.translation();
+      const Quaternion q(stamped.pose.linear());
+      out << nsToS(stamped.stamp) << " " << p.x() << " " << p.y() << " " << p.z() << " "
+          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+    }
+    if (!out) {
+      if (message) *message = "Failed while writing '" + output_path.string() + "'.";
+      return false;
+    }
+    if (message) {
+      *message = "Saved " + std::to_string(snapshot.poses.size()) +
+                 " localized poses to '" + output_path.string() + "'.";
+    }
+    return true;
+  }
 
  private:
   static ros::Duration period(double hz) { return ros::Duration(hz > 0.0 ? 1.0 / hz : 1.0); }
@@ -123,7 +175,9 @@ class Localization {
     if (!config_.publish_path || stamp == last_path_stamp_) return;
     last_path_stamp_ = stamp;
     std::lock_guard<std::mutex> lock(path_mutex_);
-    path_.poses.push_back(StampedPose{stamp, pose});
+    const StampedPose stamped{stamp, pose};
+    trajectory_.poses.push_back(stamped);
+    path_.poses.push_back(stamped);
     if (config_.path_max_poses > 0 && path_.poses.size() > config_.path_max_poses) {
       path_.poses.erase(path_.poses.begin(),
                         path_.poses.begin() + (path_.poses.size() - config_.path_max_poses));
@@ -169,6 +223,9 @@ class Localization {
   Transform latest_odom_;
   uint64_t latest_stamp_ = 0, last_pose_publish_stamp_ = 0, last_path_stamp_ = 0;
   bool have_odom_ = false;
+  // Complete map-frame localization result retained for the shutdown export.
+  Path trajectory_;
+  // Potentially bounded copy used for the live ROS path publication.
   Path path_;
   ros::Publisher odom_pub_, path_pub_, map_pub_, status_pub_;
   ros::Subscriber initial_pose_sub_;

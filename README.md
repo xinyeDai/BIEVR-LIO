@@ -97,20 +97,110 @@ BIEVR-LIO provides two ROS1 entry points:
 - **`process_bag`** reads a recorded bag directly and pushes its messages through
   the pipeline as fast as they can be processed (no real-time playback). This is the preferred choice for offline evaluation and reproducing results.
 
-In the commands below, replace `<sensor_config>` with one of the provided configs
-(see [Configuration](#configuration)) or your own. Add `rviz:=true` to bring up
-the visualization.
+### Quick start（中文）
+
+每次打开新终端后，先加载 ROS 和工作空间环境（请将路径替换为自己的
+catkin 工作空间）：
+
+```bash
+source /opt/ros/noetic/setup.bash
+source ~/catkin_ws/devel/setup.bash
+```
+
+如果刚修改过代码，需要先重新编译：
+
+```bash
+cd ~/catkin_ws
+catkin build bievr_lio_ros
+source devel/setup.bash
+```
+
+离线处理 rosbag（推荐）前，直接编辑
+`interfaces/ros1/launch/process_bag.launch` 顶部的 `sensor_config` 和
+`rosbag` 默认值，例如：
+
+```xml
+<arg name="sensor_config" default="ncd"/>
+<arg name="rosbag" default="/absolute/path/to/data.bag"/>
+```
+
+然后启动时不需要再从终端传入配置：
+
+```bash
+roslaunch bievr_lio_ros process_bag.launch
+```
+
+程序会直接读取 bag，不需要另外执行 `rosbag play`。`sensor_config` 可选
+`enwide`、`ncd`、`gamma`、`mars`、`grandtour`，也可以传入自定义 YAML
+配置文件的绝对路径。
+
+在线处理雷达和 IMU 话题前，编辑
+`interfaces/ros1/launch/process_topics.launch` 顶部的 `sensor_config` 默认值，
+然后直接启动：
+
+```bash
+roslaunch bievr_lio_ros process_topics.launch
+```
+
+如果数据来自 rosbag，请在另一个已经 source 工作空间的终端中播放：
+
+```bash
+rosbag play /absolute/path/to/data.bag
+```
+
+需要 RViz 时，在上述 `roslaunch` 命令末尾添加 `rviz:=true`。
+
+在线模式使用 `Ctrl+C` 正常结束；离线模式会在 bag 处理完成后自动结束。
+结束时程序会等待尚未累计完成的点云，并创建 `Log` 目录，输出：
+
+| File | Description |
+|------|-------------|
+| `Log/map.pcd` | 体素降采样后的累计点云地图，包含 `x y z intensity`；每个体素保留首个点及其强度 |
+| `Log/trajectory.obj` | OBJ 折线轨迹，可由 MeshLab、Blender 等软件打开 |
+| `Log/odometry_tum.txt` | TUM 格式里程计，字段为 `timestamp tx ty tz qx qy qz qw` |
+| `Log/localization_tum.txt` | Localization 模式输出的地图坐标系定位轨迹；只有成功定位后才生成 |
+
+当前 `config/params.yaml` 使用绝对路径，所有结果固定保存到项目目录：
+
+```bash
+ls -lh /home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log
+```
+
+保存点云要求 `config/params.yaml` 中的 `map_save.accumulate` 保持为
+`True`。如果程序被 `kill -9` 强制终止，则退出保存逻辑无法执行。
+
+launch 文件只负责选择配置文件、数据和 RViz，不会覆盖算法参数。运行模式
+统一在 `config/params.yaml` 中设置：
+
+- 纯里程计：`loop_closure.enable: False`，`localization.enable: False`
+- 回环建图：`loop_closure.enable: True`，`localization.enable: False`；地图包
+  默认输出到 `Log/bievr_map_bundle`
+- 地图定位：`loop_closure.enable: False`，`localization.enable: True`；默认加载
+  `Log/bievr_map_bundle`
+
+The launch files contain editable defaults for the sensor config, parameter file,
+bag path and RViz switch. Change those values at the top of the relevant launch
+file, then use the commands below without additional terminal arguments.
+
+Algorithm settings are not overridden by launch files. Configure each mode only
+in `config/params.yaml`:
+
+- Odometry: `loop_closure.enable: False`, `localization.enable: False`
+- Mapping: `loop_closure.enable: True`, `localization.enable: False`; the default
+  bundle output is `Log/bievr_map_bundle`
+- Localization: `loop_closure.enable: False`, `localization.enable: True`, and
+  load `Log/bievr_map_bundle` through `localization.map_path`
 
 Process live topics:
 
 ```bash
-roslaunch bievr_lio_ros process_topics.launch sensor_config:=<sensor_config>
+roslaunch bievr_lio_ros process_topics.launch
 ```
 
 Replay a rosbag:
 
 ```bash
-roslaunch bievr_lio_ros process_bag.launch sensor_config:=<sensor_config> rosbag:=/path/to/bag.bag
+roslaunch bievr_lio_ros process_bag.launch
 ```
 
 ## Configuration
@@ -125,10 +215,10 @@ The configuration is split in two files:
   the LiDAR and IMU topic names, the LiDAR→IMU extrinsic calibration, and the
   LiDAR min/max range.
 
-Select a sensor config at launch with `sensor_config:=<name>`, which resolves to
-`config/sensor_configs/<name>.yaml` (an absolute path starting with `/` is used
-verbatim, so configs may also live outside the package). Likewise `params:=<name>`
-(default `params`) selects `config/<name>.yaml`.
+Set the `sensor_config` default near the top of the launch file. A short name such
+as `ncd` resolves to `config/sensor_configs/ncd.yaml`; an absolute path is used
+verbatim, so configs may also live outside the package. The `params` default works
+the same way and selects a file under `config/` (the default is `params.yaml`).
 
 <details>
 <summary><b>Provided datasets</b></summary>

@@ -13,7 +13,10 @@
 
 namespace bievr {
 
-bool savePointcloudPCD(const Pointcloud& cloud, const std::string& path) {
+template <typename CloudT>
+bool savePointcloudPCDImpl(const CloudT& cloud, const std::string& path) {
+  static_assert(CloudT::kDim == 3 || CloudT::kDim == 4);
+  constexpr bool kHasIntensity = CloudT::kDim == 4;
   namespace fs = std::filesystem;
   const fs::path out(path);
   if (out.has_parent_path()) {
@@ -34,10 +37,10 @@ bool savePointcloudPCD(const Pointcloud& cloud, const std::string& path) {
   const size_t n = cloud.size();
   file << "# .PCD v0.7 - Point Cloud Data file format\n"
        << "VERSION 0.7\n"
-       << "FIELDS x y z\n"
-       << "SIZE 4 4 4\n"
-       << "TYPE F F F\n"
-       << "COUNT 1 1 1\n"
+       << (kHasIntensity ? "FIELDS x y z intensity\n" : "FIELDS x y z\n")
+       << (kHasIntensity ? "SIZE 4 4 4 4\n" : "SIZE 4 4 4\n")
+       << (kHasIntensity ? "TYPE F F F F\n" : "TYPE F F F\n")
+       << (kHasIntensity ? "COUNT 1 1 1 1\n" : "COUNT 1 1 1\n")
        << "WIDTH " << n << "\n"
        << "HEIGHT 1\n"
        << "VIEWPOINT 0 0 0 1 0 0 0\n"
@@ -46,11 +49,15 @@ bool savePointcloudPCD(const Pointcloud& cloud, const std::string& path) {
 
   // The cloud stores doubles; PCD consumers expect float32, so convert in a
   // buffer rather than writing the Eigen storage straight out.
-  std::vector<float> buffer(3 * n);
+  constexpr size_t kFields = CloudT::kDim;
+  std::vector<float> buffer(kFields * n);
   for (size_t i = 0; i < n; ++i) {
-    buffer[3 * i + 0] = static_cast<float>(cloud[i].x());
-    buffer[3 * i + 1] = static_cast<float>(cloud[i].y());
-    buffer[3 * i + 2] = static_cast<float>(cloud[i].z());
+    buffer[kFields * i + 0] = static_cast<float>(cloud[i].x());
+    buffer[kFields * i + 1] = static_cast<float>(cloud[i].y());
+    buffer[kFields * i + 2] = static_cast<float>(cloud[i].z());
+    if constexpr (kHasIntensity) {
+      buffer[kFields * i + 3] = static_cast<float>(cloud[i][3]);
+    }
   }
   file.write(reinterpret_cast<const char*>(buffer.data()),
              static_cast<std::streamsize>(buffer.size() * sizeof(float)));
@@ -59,6 +66,14 @@ bool savePointcloudPCD(const Pointcloud& cloud, const std::string& path) {
     return false;
   }
   return true;
+}
+
+bool savePointcloudPCD(const Pointcloud& cloud, const std::string& path) {
+  return savePointcloudPCDImpl(cloud, path);
+}
+
+bool savePointcloudPCD(const IntensityPointcloud& cloud, const std::string& path) {
+  return savePointcloudPCDImpl(cloud, path);
 }
 
 // Width of the dashboard table (characters between the border bars).

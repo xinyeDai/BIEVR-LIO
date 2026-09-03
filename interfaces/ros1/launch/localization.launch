@@ -1,15 +1,11 @@
 <launch>
-  <arg name="sensor_config" default="/tmp/bievr-loop-test/tzb.yaml"/>
-  <arg name="params" default="/tmp/bievr-loop-test/params_tzb_localization.yaml"/>
-  <arg name="map" default="/tmp/bievr-loop-test/map_bundle"/>
+  <!-- 算法开关和待加载地图路径统一在 config/params.yaml 中配置。 -->
+  <arg name="sensor_config" default="/home/zsq/slam/bievr-slam/src/BIEVR-LIO/config/sensor_configs/tzb.yaml"/>
+  <arg name="params" default="/home/zsq/slam/bievr-slam/src/BIEVR-LIO/config/params_localization.yaml"/>
   <arg name="rviz" default="true"/>
 
   <node pkg="bievr_lio_ros" type="process_topics" name="bievr_lio_localization_node" output="screen"
-        args="$(eval '--sensor_config_file ' + (arg('sensor_config') if arg('sensor_config').startswith('/') else find('bievr_lio_ros') + '/../../config/sensor_configs/' + arg('sensor_config') + '.yaml') + ' --params_file ' + (arg('params') if arg('params').startswith('/') else find('bievr_lio_ros') + '/../../config/' + arg('params') + '.yaml'))">
-    <param name="loop_closure_enable" value="false"/>
-    <param name="localization_enable" value="true"/>
-    <param name="map_path" value="$(arg map)"/>
-  </node>
+        args="$(eval '--sensor_config_file ' + (arg('sensor_config') if arg('sensor_config').startswith('/') else find('bievr_lio_ros') + '/../../config/sensor_configs/' + arg('sensor_config') + '.yaml') + ' --params_file ' + (arg('params') if arg('params').startswith('/') else find('bievr_lio_ros') + '/../../config/' + arg('params') + '.yaml'))"/>
 
   <group if="$(arg rviz)">
     <node pkg="rviz" type="rviz" name="rviz" args="-d $(find bievr_lio_ros)/rviz/localization.rviz"/>

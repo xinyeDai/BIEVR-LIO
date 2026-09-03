@@ -22,7 +22,7 @@ MapAccumulator::~MapAccumulator() {
   if (worker_.joinable()) worker_.join();
 }
 
-void MapAccumulator::add(Pointcloud registered) {
+void MapAccumulator::add(IntensityPointcloud registered) {
   if (registered.empty()) return;
   {
     std::lock_guard<std::mutex> lock(queue_mutex_);
@@ -37,9 +37,14 @@ void MapAccumulator::add(Pointcloud registered) {
   queue_cv_.notify_one();
 }
 
+void MapAccumulator::flush() {
+  std::unique_lock<std::mutex> lock(queue_mutex_);
+  idle_cv_.wait(lock, [this] { return queue_.empty() && !processing_; });
+}
+
 void MapAccumulator::run() {
   while (true) {
-    Pointcloud cloud;
+    IntensityPointcloud cloud;
     {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       queue_cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
@@ -47,15 +52,16 @@ void MapAccumulator::run() {
       if (queue_.empty()) return;
       cloud = std::move(queue_.front());
       queue_.pop_front();
+      processing_ = true;
     }
 
     // Hash outside the map lock so a concurrent save() only ever waits for the
     // merge below, not for the whole scan to be processed.
-    std::vector<std::pair<size_t, Point>> hashed;
+    std::vector<std::pair<size_t, IntensityPoint>> hashed;
     hashed.reserve(cloud.size());
     for (size_t i = 0; i < cloud.size(); ++i) {
-      const Point p = cloud[i];
-      const Eigen::Vector3i voxel = (p * inv_resolution_).array().floor().cast<int>();
+      const IntensityPoint p = cloud[i];
+      const Eigen::Vector3i voxel = (p.head<3>() * inv_resolution_).array().floor().cast<int>();
       hashed.emplace_back(hashIndexVoxel(voxel), p);
     }
 
@@ -66,11 +72,16 @@ void MapAccumulator::run() {
       // an area does not keep growing the cloud.
       voxels_.try_emplace(hash, point);
     }
+    {
+      std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+      processing_ = false;
+      if (queue_.empty()) idle_cv_.notify_all();
+    }
   }
 }
 
 bool MapAccumulator::save(const std::string& path, size_t* num_points) const {
-  Pointcloud cloud;
+  IntensityPointcloud cloud;
   {
     std::lock_guard<std::mutex> lock(map_mutex_);
     if (voxels_.empty()) {

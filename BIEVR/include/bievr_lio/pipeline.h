@@ -64,6 +64,11 @@ class Pipeline {
   bool saveMap(const std::string& path, std::string* written_path = nullptr,
                size_t* num_points = nullptr) const;
 
+  // Saves the final point-cloud map, OBJ trajectory and TUM odometry. When
+  // `log_dir` is empty, use the directory containing map_save_path so all
+  // configured outputs land together. Pending map work is drained first.
+  bool saveResults(const std::string& log_dir = "");
+
   // Number of points currently held in the accumulated map.
   size_t accumulatedMapSize() const { return map_accumulator_ ? map_accumulator_->size() : 0; }
 
@@ -122,7 +127,7 @@ class Pipeline {
                     const IntensityView& intensities);
   void publishLatestState(const Header& header);
   void publishPath(const Transform& pose, const Header& header);
-  void accumulateMap(const Pointcloud& registered);
+  void accumulateMap(IntensityPointcloud registered);
   void publishDebugClouds(const Pointcloud& source_filtered, const Pointcloud& source_coarse,
                           const Pointcloud& source_fine,
                           const IntensityView& intensities, const Transform& T_W_I,
@@ -146,6 +151,9 @@ class Pipeline {
   V3 latest_gyro_ = V3::Zero();
   // Full odometry trajectory, republished as a path with every state publish.
   Path path_;
+  // Complete, unbounded trajectory used for shutdown exports. This is kept
+  // independently of the optionally bounded/published ROS path.
+  Path trajectory_;
   // Collects the registered scans for saveMap() on its own thread. Null when
   // map accumulation is disabled.
   std::unique_ptr<MapAccumulator> map_accumulator_;

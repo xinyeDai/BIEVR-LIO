@@ -1,0 +1,88 @@
+map:
+  pixel_size_m: 0.05 # 像素边长 [m]
+  voxel_size_m: 0.5 # 体素边长 [m]
+  normal_tolerance_deg: 3 # 触发体素图重投影的法向变化阈值 [°]
+  smooth: True # 是否对体素图进行平滑
+  weighted: True # 是否使用加权像素更新
+  max_size: 1500000 # 地图中最多保留的体素数量
+  frame: "odom"
+
+preprocess:
+  downsample_resolution_m: 0.1 # 点云降采样分辨率 [m]；启用信息采样时对应高分辨率体素
+  informed_sampling: True
+
+optimization:
+  huber_delta: 0.1 # Huber 鲁棒核阈值
+
+imu:  
+    window_s: 10 # 惯性优化时间窗口 [s]
+    t_init: 0.2 # 初始化零偏和重力所需时间 [s]
+    frame: "imu"
+
+path:
+  publish: True # 是否以 nav_msgs/Path 发布累计轨迹
+  max_poses: 0 # 轨迹最多保留的位姿数；0 表示不限制，超出后删除最早位姿
+
+map_save: # 此处保存纯里程计地图，不是回环优化地图；回环地图由 bundle_path 保存
+  accumulate: False # 是否累计配准后的扫描，供 save_map 服务保存
+  resolution_m: 0.1 # 纯里程计累计点云的体素分辨率 [m]
+  path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/map.pcd" # 纯里程计地图的保存路径
+
+loop_closure: # 位于里程计后端的 Scan Context + GTSAM 位姿图回环模块
+  enable: False # 建图时设为 True；纯里程计或定位时设为 False
+
+  # 关键帧密度：数值越小越容易检测回环，但会增加 CPU 和内存占用
+  keyframe_meter_gap: 1.0
+
+  # Scan Context：以下参数与传感器高度和环境尺度有关
+  sc_max_radius: 80.0 # 室外建议 80，室内建议 20～40
+  sc_lidar_height: 2.0
+  sc_num_exclude_recent: 30
+  sc_dist_threshold: 0.5 # 出现误回环时应减小此值
+
+  # Scan Context 找到候选位置后，使用一次 small_gicp 进行精配准
+  history_keyframe_search_num: 25
+  icp_max_correspondence_distance: 5.0
+  loop_fitness_score_threshold: 0.2
+  # 经常反向经过同一地点时可启用 Scan Context 航向初值
+  use_sc_yaw_guess: False
+
+  # GTSAM 因子方差：对回环约束修正 LIO 轨迹的强度影响最大
+  odom_noise_rotation: 1.0e-6
+  odom_noise_translation: 1.0e-4
+  loop_noise_score: 0.5
+  loop_noise_cauchy_c: 1.0
+
+  # 地图包包含点云、优化后位姿和 Scan Context 数据库
+  bundle_path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/bievr_map_bundle"
+
+localization: # 位于里程计后端的先验地图定位模块
+  enable: True # 定位时设为 True，同时确保 loop_closure.enable 为 False
+
+  # 地图包支持自动重定位；单独的 PCD 地图需要通过 /initialpose 提供初始位姿
+  map_path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/bievr_map_bundle"
+
+  # 地图/扫描密度和驻留地图半径主要决定定位精度与内存占用
+  map_voxel_size_m: 0.3
+  scan_voxel_size_m: 0.5
+  crop_radius_m: 150.0
+  correction_frequency: 1.0 # 两次定位修正之间由 LIO 连续推算位姿
+
+  # 单次 small_gicp 的验收阈值和安全限制
+  icp_max_correspondence_distance: 1.0
+  fitness_threshold: 0.3 # 对应点欧氏距离平方的均值 [m²]
+  gicp_max_translation_step_m: 3.0
+  gicp_max_rotation_step_deg: 15.0
+
+  # 重定位描述子阈值；数值越小，候选匹配越严格
+  sc_dist_threshold: 0.2
+
+debug:
+  publish_all_clouds: False # 是否发布所有点云（精细、粗略、去畸变）
+  timing: False
+  log: False
+  dashboard: True # 是否实时显示位置、零偏、耗时等状态
+  dashboard_ascii_path: "" # 留空时使用配置文件旁的 bievr_ascii.txt
+  trajectory_path: "" # 最终 TUM 轨迹自动保存为 Log/odometry_tum.txt；此项留空避免重复写入
+
+max_num_threads: 0 # 0 表示自动选择，正数表示限制并行线程数

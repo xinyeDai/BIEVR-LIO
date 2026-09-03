@@ -5,6 +5,9 @@
 #include <tbb/task_arena.h>
 #include <topic_tools/shape_shifter.h>
 
+#include <chrono>
+#include <thread>
+
 #include "bievr_lio/config_loader.h"
 #include "bievr_lio_ros/localization.h"
 #include "bievr_lio_ros/loop_closure.h"
@@ -46,8 +49,6 @@ int main(int argc, char** argv) {
 
   bievr::LoopClosureConfig loop_config;
   if (!bievr::loadLoopClosureConfig(config.yaml_paths, loop_config)) return -1;
-  private_nh.param("loop_closure_enable", loop_config.enable, loop_config.enable);
-  private_nh.param("bundle_path", loop_config.bundle_path, loop_config.bundle_path);
   std::unique_ptr<bievr::LoopClosure> loop_closure;
   if (loop_config.enable) {
     loop_closure.reset(new bievr::LoopClosure(nh, private_nh, pipeline, loop_config, "bievr_lio"));
@@ -55,9 +56,6 @@ int main(int argc, char** argv) {
 
   bievr::LocalizationConfig localization_config;
   if (!bievr::loadLocalizationConfig(config.yaml_paths, localization_config)) return -1;
-  private_nh.param("localization_enable", localization_config.enable, localization_config.enable);
-  private_nh.param("map_path", localization_config.localizer.map_path,
-                   localization_config.localizer.map_path);
   std::unique_ptr<bievr::Localization> localization;
   if (localization_config.enable) {
     if (loop_config.enable) {
@@ -135,5 +133,45 @@ int main(int argc, char** argv) {
   // localization ICP have their own worker threads inside the core modules.
   ros::spin();
 
-  return 0;
+  int exit_code = 0;
+  if (!pipeline->saveResults()) {
+    LOG(E, "One or more final outputs could not be saved.");
+    exit_code = -1;
+  }
+
+  if (loop_closure && !loop_closure->bundlePath().empty()) {
+    // Ctrl+C makes ros::ok() false, but the loop-closure worker may still have
+    // queued keyframes. Give it a bounded interval to finish before snapshotting.
+    int idle_polls = 0;
+    int total_polls = 0;
+    while (idle_polls < 10 && total_polls++ < 100) {
+      idle_polls = loop_closure->idle() ? idle_polls + 1 : 0;
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    const auto stats = loop_closure->stats();
+    LOG(I, "Loop closure summary: " << stats.num_keyframes << " keyframes, "
+                                     << stats.num_loops << " accepted loops, "
+                                     << stats.num_rejected << " rejected candidates, "
+                                     << stats.dropped_frames << " dropped keyframes.");
+    std::string message;
+    if (!loop_closure->saveBundle(&message)) {
+      LOG(E, "Failed to save loop-closed map bundle: " << message);
+      exit_code = -1;
+    } else {
+      LOG(I, message);
+    }
+  }
+
+  if (localization) {
+    std::string message;
+    if (!localization->saveTrajectory(&message)) {
+      LOG(E, message);
+      exit_code = -1;
+    } else {
+      LOG(I, message);
+    }
+  }
+
+  return exit_code;
 }

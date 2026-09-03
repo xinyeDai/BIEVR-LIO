@@ -30,7 +30,10 @@ Visualization Manager:
     - Class: rviz/PointCloud2
       Name: Current Scan
       Enabled: true
-      Topic: /bievr_lio/points/coarse
+      # The coarse cloud is a debug-only topic and is absent when
+      # debug.publish_all_clouds is false. The registered cloud is always
+      # published and carries the original intensity channel.
+      Topic: /bievr_lio/points/registered
       Queue Size: 5
       Style: Points
       Size (Pixels): 3

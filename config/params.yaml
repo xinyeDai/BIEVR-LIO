@@ -25,11 +25,11 @@ path:
 
 map_save: # 此处保存纯里程计地图，不是回环优化地图；回环地图由 bundle_path 保存
   accumulate: True # 是否累计配准后的扫描，供 save_map 服务保存
-  resolution_m: 0.05 # 纯里程计累计点云的体素分辨率 [m]
-  path: "bievr_map.pcd" # 纯里程计地图的保存路径
+  resolution_m: 0.1 # 纯里程计累计点云的体素分辨率 [m]
+  path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/map.pcd" # 纯里程计地图的保存路径
 
 loop_closure: # 位于里程计后端的 Scan Context + GTSAM 位姿图回环模块
-  enable: False # mapping.launch 会覆盖此项；普通 process_topics 默认仅运行里程计
+  enable: False # 建图时设为 True；纯里程计或定位时设为 False
 
   # 关键帧密度：数值越小越容易检测回环，但会增加 CPU 和内存占用
   keyframe_meter_gap: 1.0
@@ -54,13 +54,13 @@ loop_closure: # 位于里程计后端的 Scan Context + GTSAM 位姿图回环模
   loop_noise_cauchy_c: 1.0
 
   # 地图包包含点云、优化后位姿和 Scan Context 数据库
-  bundle_path: "bievr_map_bundle"
+  bundle_path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/bievr_map_bundle"
 
 localization: # 位于里程计后端的先验地图定位模块
-  enable: False
+  enable: False # 定位时设为 True，同时确保 loop_closure.enable 为 False
 
   # 地图包支持自动重定位；单独的 PCD 地图需要通过 /initialpose 提供初始位姿
-  map_path: "bievr_map_bundle"
+  map_path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/bievr_map_bundle"
 
   # 地图/扫描密度和驻留地图半径主要决定定位精度与内存占用
   map_voxel_size_m: 0.3
@@ -83,6 +83,6 @@ debug:
   log: False
   dashboard: True # 是否实时显示位置、零偏、耗时等状态
   dashboard_ascii_path: "" # 留空时使用配置文件旁的 bievr_ascii.txt
-  trajectory_path: "" # 轨迹保存路径；留空表示不保存轨迹日志
+  trajectory_path: "" # 最终 TUM 轨迹自动保存为 Log/odometry_tum.txt；此项留空避免重复写入
 
 max_num_threads: 0 # 0 表示自动选择，正数表示限制并行线程数

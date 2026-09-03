@@ -35,7 +35,11 @@ class MapAccumulator {
   MapAccumulator& operator=(const MapAccumulator&) = delete;
 
   // Hands a world-frame cloud to the worker and returns without touching the map.
-  void add(Pointcloud registered);
+  void add(IntensityPointcloud registered);
+
+  // Waits until every cloud already handed to the worker has been merged.
+  // Call this before a final save at shutdown so the last scans are included.
+  void flush();
 
   // Snapshots the map and writes it as a binary PCD. Returns false if nothing
   // has been accumulated yet or the file cannot be written.
@@ -51,12 +55,16 @@ class MapAccumulator {
   size_t max_queue_;
 
   mutable std::mutex map_mutex_;
-  ankerl::unordered_dense::map<size_t, Point> voxels_;
+  // The first point inserted into a voxel is retained together with its
+  // intensity; later points in the same voxel do not overwrite either value.
+  ankerl::unordered_dense::map<size_t, IntensityPoint> voxels_;
 
   mutable std::mutex queue_mutex_;
   std::condition_variable queue_cv_;
-  std::deque<Pointcloud> queue_;
+  std::condition_variable idle_cv_;
+  std::deque<IntensityPointcloud> queue_;
   size_t dropped_{0};
+  bool processing_{false};
   bool stop_{false};
 
   std::thread worker_;

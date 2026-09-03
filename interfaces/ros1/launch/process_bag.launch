@@ -1,8 +1,9 @@
 <launch>
-  <arg name="sensor_config"/>
+  <!-- 启动前在这里修改传感器配置和 rosbag 的绝对路径。 -->
+  <arg name="sensor_config" default="ncd"/>
   <arg name="params" default="params"/>
   <arg name="rviz" default="false"/>
-  <arg name="rosbag"/>
+  <arg name="rosbag" default="/absolute/path/to/data.bag"/>
   <!-- The node reads the YAML config-file paths (and bag path) from its
        command-line arguments (not the ROS parameter server), via args=. An
        absolute path (starting with '/') is used verbatim so configs can live in

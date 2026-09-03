@@ -1,6 +1,8 @@
 #include "bievr_lio/pipeline.h"
 
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 
 #include "bievr_lio/inertial_factor.h"
@@ -234,8 +236,9 @@ void Pipeline::tryInitMap(uint64_t stamp, const State& x_j_pred, const Transform
   map_->integratePoints(registered, &ranges);
   addState(stamp, x_j_pred.quat, x_j_pred.p, x_j_pred.v);
   publishLatestState(header);
-  accumulateMap(registered);
-  publish(IntensityPointcloud(registered, intensities), header, "points/registered");
+  IntensityPointcloud registered_with_intensity(registered, intensities);
+  publish(registered_with_intensity, header, "points/registered");
+  accumulateMap(std::move(registered_with_intensity));
   if (map_->size() > config_.map_size_running_threshold) {
     phase_ = Phase::Running;
   }
@@ -353,8 +356,9 @@ void Pipeline::publishFrame(const Header& header, const Transform& T_W_I,
     publishDebugClouds(source_filtered, source_coarse, source_fine, intensities, T_W_I,
                        header);
   }
-  accumulateMap(full_registered);
-  publish(IntensityPointcloud(full_registered, intensities), header, "points/registered");
+  IntensityPointcloud registered_with_intensity(full_registered, intensities);
+  publish(registered_with_intensity, header, "points/registered");
+  accumulateMap(std::move(registered_with_intensity));
   Header body_header = header;
   body_header.frame = config_.body_frame;
   // The undistorted cloud keeps its original point order, so the snapshotted
@@ -386,10 +390,10 @@ void Pipeline::publishLatestState(const Header& header) {
   publishPath(odom.pose, header);
 }
 
-void Pipeline::accumulateMap(const Pointcloud& registered) {
+void Pipeline::accumulateMap(IntensityPointcloud registered) {
   // Copies the cloud into the worker's queue and returns; the hashing itself
   // happens off the odometry thread.
-  if (map_accumulator_) map_accumulator_->add(registered);
+  if (map_accumulator_) map_accumulator_->add(std::move(registered));
 }
 
 bool Pipeline::saveMap(const std::string& path, std::string* written_path,
@@ -407,7 +411,70 @@ bool Pipeline::saveMap(const std::string& path, std::string* written_path,
   return true;
 }
 
+bool Pipeline::saveResults(const std::string& log_dir) {
+  namespace fs = std::filesystem;
+  fs::path output_dir(log_dir);
+  if (output_dir.empty()) {
+    const fs::path configured_map(config_.map_save_path);
+    output_dir = configured_map.has_parent_path() ? configured_map.parent_path() : fs::path("Log");
+  }
+  std::error_code ec;
+  fs::create_directories(output_dir, ec);
+  if (ec) {
+    LOG(E, "Failed to create log directory '" << output_dir.string() << "': " << ec.message());
+    return false;
+  }
+
+  bool success = true;
+  if (map_accumulator_) {
+    map_accumulator_->flush();
+    success = saveMap((output_dir / "map.pcd").string()) && success;
+  } else {
+    LOG(W, "Skipping final map: map accumulation is disabled.");
+    success = false;
+  }
+
+  const fs::path obj_path = output_dir / "trajectory.obj";
+  std::ofstream obj(obj_path);
+  if (!obj) {
+    LOG(E, "Failed to open '" << obj_path.string() << "'.");
+    success = false;
+  } else {
+    obj << std::setprecision(15);
+    for (const auto& stamped : trajectory_.poses) {
+      const V3& p = stamped.pose.translation();
+      obj << "v " << p.x() << " " << p.y() << " " << p.z() << "\n";
+    }
+    if (trajectory_.poses.size() >= 2) {
+      obj << "l";
+      for (size_t i = 0; i < trajectory_.poses.size(); ++i) obj << " " << i + 1;
+      obj << "\n";
+    }
+    LOG(I, "Saved OBJ trajectory with " << trajectory_.poses.size() << " poses to '"
+                                         << obj_path.string() << "'.");
+  }
+
+  const fs::path tum_path = output_dir / "odometry_tum.txt";
+  std::ofstream tum(tum_path);
+  if (!tum) {
+    LOG(E, "Failed to open '" << tum_path.string() << "'.");
+    success = false;
+  } else {
+    tum << std::fixed << std::setprecision(9);
+    for (const auto& stamped : trajectory_.poses) {
+      const V3& p = stamped.pose.translation();
+      const Quaternion q(stamped.pose.linear());
+      tum << nsToS(stamped.stamp) << " " << p.x() << " " << p.y() << " " << p.z() << " "
+          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+    }
+    LOG(I, "Saved TUM odometry with " << trajectory_.poses.size() << " poses to '"
+                                       << tum_path.string() << "'.");
+  }
+  return success;
+}
+
 void Pipeline::publishPath(const Transform& pose, const Header& header) {
+  trajectory_.poses.push_back(StampedPose{header.stamp, pose});
   if (!config_.publish_path) return;
 
   path_.poses.push_back(StampedPose{header.stamp, pose});

@@ -48,8 +48,6 @@ int main(int argc, char** argv) {
   bievr::SaveMapService save_map_service(private_nh, pipeline);
   bievr::LoopClosureConfig loop_config;
   if (!bievr::loadLoopClosureConfig(config.yaml_paths, loop_config)) return -1;
-  private_nh.param("loop_closure_enable", loop_config.enable, loop_config.enable);
-  private_nh.param("bundle_path", loop_config.bundle_path, loop_config.bundle_path);
   std::unique_ptr<bievr::LoopClosure> loop_closure;
   if (loop_config.enable) {
     loop_closure.reset(new bievr::LoopClosure(nh, private_nh, pipeline, loop_config, "bievr_lio"));
@@ -100,10 +98,17 @@ int main(int argc, char** argv) {
   bag.close();
   LOG(I, "Bag closed");
 
+  int exit_code = 0;
+  if (!pipeline->saveResults()) {
+    LOG(E, "One or more final outputs could not be saved.");
+    exit_code = -1;
+  }
+
   if (loop_closure && !loop_closure->bundlePath().empty()) {
     ros::Rate wait_rate(10.0);
     int idle_polls = 0;
-    while (ros::ok() && idle_polls < 10) {
+    int total_polls = 0;
+    while (ros::ok() && idle_polls < 10 && total_polls++ < 100) {
       ros::spinOnce();
       idle_polls = loop_closure->idle() ? idle_polls + 1 : 0;
       wait_rate.sleep();
@@ -116,10 +121,11 @@ int main(int argc, char** argv) {
                                      << stats.dropped_frames << " dropped keyframes.");
     if (!loop_closure->saveBundle(&message)) {
       LOG(E, "Failed to save loop-closed map bundle: " << message);
-      return -1;
+      exit_code = -1;
+    } else {
+      LOG(I, message);
     }
-    LOG(I, message);
   }
 
-  return 0;
+  return exit_code;
 }

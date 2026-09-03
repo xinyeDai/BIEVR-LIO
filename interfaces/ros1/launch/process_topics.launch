@@ -1,5 +1,7 @@
 <launch>
-  <arg name="sensor_config"/>
+  <!-- 在这里直接修改传感器配置；可填写 config/sensor_configs 下的文件名（不含 .yaml），
+       也可以填写自定义配置文件的绝对路径。 -->
+  <arg name="sensor_config" default="ncd"/>
   <arg name="params" default="params"/>
   <arg name="rviz" default="false"/>
   <!-- The node reads the YAML config-file paths from its command-line arguments
