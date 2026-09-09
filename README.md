@@ -265,6 +265,25 @@ rosrun bievr_lio_ros gnss_optimize --bag data.bag \
   --lio_trajectory Log/odometry_tum.txt --output_directory Log/gnss_optimization
 ```
 
+该工具是离线批优化：先读取完整 LIO 轨迹和 bag 内 GNSS，再执行 GTSAM LM；不是
+随每帧增量更新的实时 iSAM2 节点。GNSS 按时间插值约束相邻 LIO 位姿，并使用
+`p_antenna = p_body + R_body * lever_arm` 杆臂模型。可在
+`interfaces/ros1/launch/gnss_optimize.launch` 配置杆臂、协方差缩放/轴向标准差覆盖、
+Huber/Cauchy 鲁棒核以及第一轮优化后的卡方异常值剔除。铁路配置将
+`odom_neighbor_span` 设为 `3`，以加入参考 PGO 的多邻接 LIO 边；这些组合边与相邻
+边相关，如果数据噪声较大或希望更保守，可改回 `1`。
+
+为避免 GNSS 因子逐帧拉动 LIO 位姿并破坏原有点云配准结构，图中默认每 `0.5 s`
+选取一个控制位姿；优化后对 `map<-odom` 修正做平滑插值，再作用到全部原始 LIO
+位姿。将 `control_pose_interval_s` 设为 `0` 可恢复逐帧优化。
+
+节点还会读取 `pointcloud_topic`（默认 `/livox/lidar`），按 GNSS 优化后的 LIO
+位姿重新累积点云，并输出带强度的 `gnss_optimized_map.pcd`。地图采用体素降采样，
+默认分辨率为 `0.15 m`，并根据 Livox 点内时间在扫描首尾优化位姿之间做 32 段
+运动补偿；可通过 `output_map`、`map_voxel_resolution_m` 和距离门限参数调整。
+当前襄阳传感器配置的 LiDAR→IMU 外参为单位阵；其他设备需要在地图重建代码中补入
+对应的 `T_I_L` 外参，否则点云会有固定外参偏移。
+
 首次支柱建图把输出的 `gnss_optimized_tum.txt` 填入
 `pole_extraction.mapping_trajectory_path`；第二次支柱定位必须清空该项，运行时
 只使用 LIO 和 `landmarks.txt`。节点还输出含完整初始四元数的

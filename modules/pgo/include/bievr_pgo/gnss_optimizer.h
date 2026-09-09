@@ -31,8 +31,20 @@ class GnssTrajectoryOptimizer {
     double max_time_gap_s = 0.20;
     double horizontal_sigma_floor_m = 0.05;
     double vertical_sigma_floor_m = 0.10;
-    double gnss_huber_delta = 2.5;  // normalized residual units
+    double gnss_covariance_scale = 1.0;
+    // A positive component overrides the corresponding NavSatFix standard
+    // deviation. A non-positive component keeps the (scaled) message value.
+    V3 gnss_sigma_override_m = V3::Constant(-1.0);
+    std::string gnss_robust_kernel = "Huber";  // Huber | Cauchy | None
+    double gnss_robust_delta = 2.5;             // normalized residual units
     double initial_outlier_gate_m = 3.0;
+    // Raw normalized squared residual threshold after the first solve. Set to
+    // zero to disable the second-stage GNSS outlier rejection.
+    double postfit_outlier_chi2 = 50.0;
+
+    // Antenna position expressed in the LIO pose/body frame. The measurement
+    // residual is p_body + R_body * lever_arm - p_gnss.
+    V3 gnss_lever_arm_body_m = V3::Zero();
 
     // Per sqrt(m) LIO relative-motion noise. A short stationary edge still
     // receives the minimum edge scale below to avoid an unrealistically rigid
@@ -40,6 +52,14 @@ class GnssTrajectoryOptimizer {
     double odom_rotation_sigma_deg_per_sqrt_m = 0.02;
     double odom_translation_sigma_m_per_sqrt_m = 0.02;
     double minimum_edge_distance_m = 0.10;
+    // Only these temporally spaced LIO poses become graph variables. The
+    // optimized map<-odom correction is interpolated back onto every raw pose,
+    // preserving the dense LIO trajectory's local registration structure.
+    // Set to zero to retain the legacy one-variable-per-pose graph.
+    double control_pose_interval_s = 0.50;
+    // Values greater than one reproduce run_pgo's multi-neighbour edges.
+    // Three is used for the railway GNSS batch configuration.
+    int odom_neighbor_span = 3;
     double prior_roll_pitch_sigma_deg = 1.0;
     double prior_yaw_sigma_deg = 5.0;
     double prior_translation_sigma_m = 100.0;
@@ -48,10 +68,12 @@ class GnssTrajectoryOptimizer {
 
   struct Stats {
     size_t input_poses = 0;
+    size_t control_poses = 0;
     size_t input_measurements = 0;
     size_t used_measurements = 0;
     size_t rejected_time = 0;
     size_t rejected_outlier = 0;
+    size_t rejected_postfit = 0;
     double initial_horizontal_rmse_m = 0.0;
     double optimized_horizontal_rmse_m = 0.0;
     double initial_3d_rmse_m = 0.0;

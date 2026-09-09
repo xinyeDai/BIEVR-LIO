@@ -10,6 +10,7 @@
 #include <gtsam/slam/PriorFactor.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <sstream>
@@ -38,8 +39,12 @@ class InterpolatedPositionFactor
 
   InterpolatedPositionFactor(gtsam::Key first, gtsam::Key second, double alpha,
                              const gtsam::Point3& measurement,
+                             const gtsam::Point3& lever_arm,
                              const gtsam::SharedNoiseModel& model)
-      : Base(model, first, second), alpha_(alpha), measurement_(measurement) {}
+      : Base(model, first, second),
+        alpha_(alpha),
+        measurement_(measurement),
+        lever_arm_(lever_arm) {}
 
   gtsam::Vector evaluateError(
       const gtsam::Pose3& first, const gtsam::Pose3& second,
@@ -47,8 +52,10 @@ class InterpolatedPositionFactor
       boost::optional<gtsam::Matrix&> H_second = boost::none) const override {
     gtsam::Matrix36 J_first;
     gtsam::Matrix36 J_second;
-    const gtsam::Point3 p_first = first.translation(H_first ? &J_first : nullptr);
-    const gtsam::Point3 p_second = second.translation(H_second ? &J_second : nullptr);
+    const gtsam::Point3 p_first =
+        first.transformFrom(lever_arm_, H_first ? &J_first : nullptr);
+    const gtsam::Point3 p_second =
+        second.transformFrom(lever_arm_, H_second ? &J_second : nullptr);
     if (H_first) *H_first = (1.0 - alpha_) * J_first;
     if (H_second) *H_second = alpha_ * J_second;
     return (1.0 - alpha_) * p_first + alpha_ * p_second - measurement_;
@@ -57,6 +64,7 @@ class InterpolatedPositionFactor
  private:
   double alpha_;
   gtsam::Point3 measurement_;
+  gtsam::Point3 lever_arm_;
 };
 
 struct Association {
@@ -66,10 +74,16 @@ struct Association {
   const GnssTrajectoryOptimizer::PositionMeasurement* measurement = nullptr;
 };
 
+V3 antennaPosition(const GnssTrajectoryOptimizer::StampedPose& pose,
+                   const V3& lever_arm) {
+  return pose.pose.translation() + pose.pose.rotation() * lever_arm;
+}
+
 V3 interpolatePosition(const std::vector<GnssTrajectoryOptimizer::StampedPose>& poses,
-                       const Association& association) {
-  return (1.0 - association.alpha) * poses[association.first].pose.translation() +
-         association.alpha * poses[association.second].pose.translation();
+                       const Association& association, const V3& lever_arm) {
+  return (1.0 - association.alpha) *
+             antennaPosition(poses[association.first], lever_arm) +
+         association.alpha * antennaPosition(poses[association.second], lever_arm);
 }
 
 bool associate(const std::vector<GnssTrajectoryOptimizer::StampedPose>& poses,
@@ -96,11 +110,12 @@ bool associate(const std::vector<GnssTrajectoryOptimizer::StampedPose>& poses,
 }
 
 Transform planarAlignment(const std::vector<GnssTrajectoryOptimizer::StampedPose>& lio,
-                          const std::vector<Association>& associations) {
+                          const std::vector<Association>& associations,
+                          const V3& lever_arm) {
   V3 source_mean = V3::Zero();
   V3 target_mean = V3::Zero();
   for (const Association& association : associations) {
-    source_mean += interpolatePosition(lio, association);
+    source_mean += interpolatePosition(lio, association, lever_arm);
     target_mean += association.measurement->position;
   }
   const double count = static_cast<double>(associations.size());
@@ -109,7 +124,7 @@ Transform planarAlignment(const std::vector<GnssTrajectoryOptimizer::StampedPose
   double dot = 0.0;
   double cross = 0.0;
   for (const Association& association : associations) {
-    const V3 source = interpolatePosition(lio, association) - source_mean;
+    const V3 source = interpolatePosition(lio, association, lever_arm) - source_mean;
     const V3 target = association.measurement->position - target_mean;
     dot += source.x() * target.x() + source.y() * target.y();
     cross += source.x() * target.y() - source.y() * target.x();
@@ -126,11 +141,11 @@ struct ResidualStats {
 
 ResidualStats residualStats(
     const std::vector<GnssTrajectoryOptimizer::StampedPose>& poses,
-    const std::vector<Association>& associations) {
+    const std::vector<Association>& associations, const V3& lever_arm) {
   double horizontal_squared = 0.0;
   double three_dimensional_squared = 0.0;
   for (const Association& association : associations) {
-    const V3 residual = interpolatePosition(poses, association) -
+    const V3 residual = interpolatePosition(poses, association, lever_arm) -
                         association.measurement->position;
     horizontal_squared += residual.head<2>().squaredNorm();
     three_dimensional_squared += residual.squaredNorm();
@@ -143,6 +158,115 @@ ResidualStats residualStats(
         std::sqrt(three_dimensional_squared / static_cast<double>(associations.size()));
   }
   return result;
+}
+
+gtsam::Vector3 gnssSigmas(
+    const GnssTrajectoryOptimizer::PositionMeasurement& measurement,
+    const GnssTrajectoryOptimizer::Config& config) {
+  const V3 variance =
+      (measurement.variance * config.gnss_covariance_scale).cwiseMax(V3::Zero());
+  gtsam::Vector3 sigmas;
+  sigmas << std::max(std::sqrt(variance.x()), config.horizontal_sigma_floor_m),
+      std::max(std::sqrt(variance.y()), config.horizontal_sigma_floor_m),
+      std::max(std::sqrt(variance.z()), config.vertical_sigma_floor_m);
+  for (int axis = 0; axis < 3; ++axis) {
+    if (config.gnss_sigma_override_m[axis] > 0.0) {
+      sigmas[axis] = config.gnss_sigma_override_m[axis];
+    }
+  }
+  return sigmas;
+}
+
+gtsam::SharedNoiseModel gnssNoise(
+    const GnssTrajectoryOptimizer::PositionMeasurement& measurement,
+    const GnssTrajectoryOptimizer::Config& config) {
+  const auto gaussian = gtsam::noiseModel::Diagonal::Sigmas(
+      gnssSigmas(measurement, config));
+  std::string kernel = config.gnss_robust_kernel;
+  std::transform(kernel.begin(), kernel.end(), kernel.begin(),
+                 [](unsigned char value) { return std::tolower(value); });
+  if (kernel == "none") return gaussian;
+  if (kernel == "cauchy") {
+    return gtsam::noiseModel::Robust::Create(
+        gtsam::noiseModel::mEstimator::Cauchy::Create(config.gnss_robust_delta),
+        gaussian);
+  }
+  return gtsam::noiseModel::Robust::Create(
+      gtsam::noiseModel::mEstimator::Huber::Create(config.gnss_robust_delta), gaussian);
+}
+
+double normalizedSquaredResidual(
+    const std::vector<GnssTrajectoryOptimizer::StampedPose>& poses,
+    const Association& association,
+    const GnssTrajectoryOptimizer::Config& config) {
+  const V3 residual = interpolatePosition(
+      poses, association, config.gnss_lever_arm_body_m);
+  const gtsam::Vector3 sigmas = gnssSigmas(*association.measurement, config);
+  return ((residual - association.measurement->position).array() /
+          sigmas.array()).matrix().squaredNorm();
+}
+
+std::vector<GnssTrajectoryOptimizer::StampedPose> selectControlPoses(
+    const std::vector<GnssTrajectoryOptimizer::StampedPose>& lio,
+    double interval_s) {
+  if (interval_s <= 0.0) return lio;
+  std::vector<GnssTrajectoryOptimizer::StampedPose> controls;
+  controls.reserve(static_cast<size_t>(
+      std::ceil(static_cast<double>(lio.back().stamp - lio.front().stamp) * 1e-9 /
+                interval_s)) + 2);
+  controls.push_back(lio.front());
+  const uint64_t interval_ns = static_cast<uint64_t>(std::llround(interval_s * 1e9));
+  for (size_t index = 1; index + 1 < lio.size(); ++index) {
+    if (lio[index].stamp - controls.back().stamp >= interval_ns) {
+      controls.push_back(lio[index]);
+    }
+  }
+  if (controls.back().stamp != lio.back().stamp) controls.push_back(lio.back());
+  return controls;
+}
+
+Transform interpolateTransform(const Transform& first, const Transform& second,
+                               double alpha) {
+  const Quaternion rotation =
+      Quaternion(first.rotation()).slerp(alpha, Quaternion(second.rotation())).normalized();
+  const V3 translation =
+      (1.0 - alpha) * first.translation() + alpha * second.translation();
+  return Transform(rotation, translation);
+}
+
+std::vector<GnssTrajectoryOptimizer::StampedPose> applyInterpolatedCorrections(
+    const std::vector<GnssTrajectoryOptimizer::StampedPose>& lio,
+    const std::vector<GnssTrajectoryOptimizer::StampedPose>& control_lio,
+    const std::vector<GnssTrajectoryOptimizer::StampedPose>& optimized_controls) {
+  std::vector<GnssTrajectoryOptimizer::StampedPose> corrections;
+  corrections.reserve(control_lio.size());
+  for (size_t index = 0; index < control_lio.size(); ++index) {
+    corrections.push_back(
+        {control_lio[index].stamp,
+         Transform(optimized_controls[index].pose * control_lio[index].pose.inverse())});
+  }
+  std::vector<GnssTrajectoryOptimizer::StampedPose> output;
+  output.reserve(lio.size());
+  size_t upper_index = 1;
+  for (const auto& raw : lio) {
+    while (upper_index + 1 < corrections.size() &&
+           corrections[upper_index].stamp < raw.stamp) {
+      ++upper_index;
+    }
+    const size_t lower_index = upper_index - 1;
+    const uint64_t duration =
+        corrections[upper_index].stamp - corrections[lower_index].stamp;
+    const double alpha = duration == 0
+                             ? 0.0
+                             : static_cast<double>(raw.stamp -
+                                                   corrections[lower_index].stamp) /
+                                   static_cast<double>(duration);
+    const Transform correction = interpolateTransform(
+        corrections[lower_index].pose, corrections[upper_index].pose,
+        std::clamp(alpha, 0.0, 1.0));
+    output.push_back({raw.stamp, Transform(correction * raw.pose)});
+  }
+  return output;
 }
 
 }  // namespace
@@ -165,11 +289,14 @@ bool GnssTrajectoryOptimizer::optimize(
     return false;
   }
   if (config_.max_time_gap_s <= 0.0 || config_.horizontal_sigma_floor_m <= 0.0 ||
-      config_.vertical_sigma_floor_m <= 0.0 || config_.gnss_huber_delta <= 0.0 ||
+      config_.vertical_sigma_floor_m <= 0.0 || config_.gnss_covariance_scale <= 0.0 ||
+      config_.gnss_robust_delta <= 0.0 ||
       config_.initial_outlier_gate_m <= 0.0 ||
       config_.odom_rotation_sigma_deg_per_sqrt_m <= 0.0 ||
       config_.odom_translation_sigma_m_per_sqrt_m <= 0.0 ||
-      config_.minimum_edge_distance_m <= 0.0 || config_.max_iterations <= 0) {
+      config_.minimum_edge_distance_m <= 0.0 || config_.odom_neighbor_span <= 0 ||
+      config_.control_pose_interval_s < 0.0 ||
+      config_.postfit_outlier_chi2 < 0.0 || config_.max_iterations <= 0) {
     if (message) *message = "Invalid non-positive GNSS optimizer configuration.";
     return false;
   }
@@ -181,12 +308,18 @@ bool GnssTrajectoryOptimizer::optimize(
     return false;
   }
 
+  const std::vector<StampedPose> control_lio =
+      selectControlPoses(lio, config_.control_pose_interval_s);
+  stats.control_poses = control_lio.size();
+  const double association_gap_s =
+      std::max(config_.max_time_gap_s, config_.control_pose_interval_s);
+
   std::vector<Association> candidates;
   candidates.reserve(gnss.size());
   for (const PositionMeasurement& measurement : gnss) {
     Association association;
     if (measurement.position.allFinite() && measurement.variance.allFinite() &&
-        associate(lio, measurement, config_.max_time_gap_s, association)) {
+        associate(control_lio, measurement, association_gap_s, association)) {
       candidates.push_back(association);
     } else {
       ++stats.rejected_time;
@@ -197,8 +330,9 @@ bool GnssTrajectoryOptimizer::optimize(
     return false;
   }
 
-  stats.initial_T_enu_odom = planarAlignment(lio, candidates);
-  std::vector<StampedPose> initialized = lio;
+  stats.initial_T_enu_odom =
+      planarAlignment(control_lio, candidates, config_.gnss_lever_arm_body_m);
+  std::vector<StampedPose> initialized = control_lio;
   for (StampedPose& pose : initialized) {
     pose.pose = Transform(stats.initial_T_enu_odom * pose.pose);
   }
@@ -206,7 +340,8 @@ bool GnssTrajectoryOptimizer::optimize(
   std::vector<Association> associations;
   associations.reserve(candidates.size());
   for (const Association& association : candidates) {
-    const V3 residual = interpolatePosition(initialized, association) -
+    const V3 residual = interpolatePosition(
+                            initialized, association, config_.gnss_lever_arm_body_m) -
                         association.measurement->position;
     if (residual.head<2>().norm() <= config_.initial_outlier_gate_m) {
       associations.push_back(association);
@@ -218,12 +353,11 @@ bool GnssTrajectoryOptimizer::optimize(
     if (message) *message = "GNSS outlier gate retained fewer than three fixes.";
     return false;
   }
-  stats.used_measurements = associations.size();
-  const ResidualStats before = residualStats(initialized, associations);
+  const ResidualStats before = residualStats(
+      initialized, associations, config_.gnss_lever_arm_body_m);
   stats.initial_horizontal_rmse_m = before.horizontal_rmse;
   stats.initial_3d_rmse_m = before.three_dimensional_rmse;
 
-  gtsam::NonlinearFactorGraph graph;
   gtsam::Values values;
   for (size_t index = 0; index < initialized.size(); ++index) {
     values.insert(index, toPose3(initialized[index].pose));
@@ -236,66 +370,99 @@ bool GnssTrajectoryOptimizer::optimize(
       config_.prior_yaw_sigma_deg * degrees_to_radians,
       config_.prior_translation_sigma_m, config_.prior_translation_sigma_m,
       config_.prior_translation_sigma_m;
-  graph.add(gtsam::PriorFactor<gtsam::Pose3>(
-      0, toPose3(initialized.front().pose),
-      gtsam::noiseModel::Diagonal::Sigmas(prior_sigmas)));
+  auto buildGraph = [&](const std::vector<Association>& active_associations) {
+    gtsam::NonlinearFactorGraph graph;
+    graph.add(gtsam::PriorFactor<gtsam::Pose3>(
+        0, toPose3(initialized.front().pose),
+        gtsam::noiseModel::Diagonal::Sigmas(prior_sigmas)));
+    for (size_t first = 0; first < control_lio.size(); ++first) {
+      for (int step = 1; step <= config_.odom_neighbor_span; ++step) {
+        const size_t second = first + static_cast<size_t>(step);
+        if (second >= control_lio.size()) break;
+        const gtsam::Pose3 previous = toPose3(control_lio[first].pose);
+        const gtsam::Pose3 current = toPose3(control_lio[second].pose);
+        const double distance = std::max(
+            config_.minimum_edge_distance_m,
+            (control_lio[second].pose.translation() -
+             control_lio[first].pose.translation()).norm());
+        const double scale = std::sqrt(distance);
+        const double rotation_sigma =
+            config_.odom_rotation_sigma_deg_per_sqrt_m * degrees_to_radians * scale;
+        const double translation_sigma =
+            config_.odom_translation_sigma_m_per_sqrt_m * scale;
+        gtsam::Vector6 sigmas;
+        sigmas << rotation_sigma, rotation_sigma, rotation_sigma, translation_sigma,
+            translation_sigma, translation_sigma;
+        graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
+            first, second, previous.between(current),
+            gtsam::noiseModel::Diagonal::Sigmas(sigmas)));
+      }
+    }
+    for (const Association& association : active_associations) {
+      graph.emplace_shared<InterpolatedPositionFactor>(
+          association.first, association.second, association.alpha,
+          gtsam::Point3(association.measurement->position),
+          gtsam::Point3(config_.gnss_lever_arm_body_m),
+          gnssNoise(*association.measurement, config_));
+    }
+    return graph;
+  };
 
-  for (size_t index = 1; index < lio.size(); ++index) {
-    const gtsam::Pose3 previous = toPose3(lio[index - 1].pose);
-    const gtsam::Pose3 current = toPose3(lio[index].pose);
-    const double distance = std::max(
-        config_.minimum_edge_distance_m,
-        (lio[index].pose.translation() - lio[index - 1].pose.translation()).norm());
-    const double scale = std::sqrt(distance);
-    const double rotation_sigma =
-        config_.odom_rotation_sigma_deg_per_sqrt_m * degrees_to_radians * scale;
-    const double translation_sigma =
-        config_.odom_translation_sigma_m_per_sqrt_m * scale;
-    gtsam::Vector6 sigmas;
-    sigmas << rotation_sigma, rotation_sigma, rotation_sigma, translation_sigma,
-        translation_sigma, translation_sigma;
-    graph.add(gtsam::BetweenFactor<gtsam::Pose3>(
-        index - 1, index, previous.between(current),
-        gtsam::noiseModel::Diagonal::Sigmas(sigmas)));
-  }
-
-  for (const Association& association : associations) {
-    const V3 variance = association.measurement->variance.cwiseMax(V3::Zero());
-    gtsam::Vector3 sigmas;
-    sigmas << std::max(std::sqrt(variance.x()), config_.horizontal_sigma_floor_m),
-        std::max(std::sqrt(variance.y()), config_.horizontal_sigma_floor_m),
-        std::max(std::sqrt(variance.z()), config_.vertical_sigma_floor_m);
-    const auto gaussian = gtsam::noiseModel::Diagonal::Sigmas(sigmas);
-    const auto robust = gtsam::noiseModel::Robust::Create(
-        gtsam::noiseModel::mEstimator::Huber::Create(config_.gnss_huber_delta), gaussian);
-    graph.emplace_shared<InterpolatedPositionFactor>(
-        association.first, association.second, association.alpha,
-        gtsam::Point3(association.measurement->position), robust);
-  }
-
+  std::vector<StampedPose> optimized_controls;
   try {
+    gtsam::NonlinearFactorGraph graph = buildGraph(associations);
     stats.initial_error = graph.error(values);
     gtsam::LevenbergMarquardtParams parameters;
     parameters.maxIterations = config_.max_iterations;
     parameters.setVerbosityLM("SILENT");
-    const gtsam::Values result =
+    gtsam::Values result =
         gtsam::LevenbergMarquardtOptimizer(graph, values, parameters).optimize();
-    stats.final_error = graph.error(result);
-    optimized.reserve(lio.size());
-    for (size_t index = 0; index < lio.size(); ++index) {
-      optimized.push_back({lio[index].stamp, toTransform(result.at<gtsam::Pose3>(index))});
+
+    std::vector<StampedPose> first_pass;
+    first_pass.reserve(control_lio.size());
+    for (size_t index = 0; index < control_lio.size(); ++index) {
+      first_pass.push_back(
+          {control_lio[index].stamp, toTransform(result.at<gtsam::Pose3>(index))});
     }
+    std::vector<Association> retained;
+    retained.reserve(associations.size());
+    size_t rejected_postfit = 0;
+    for (const Association& association : associations) {
+      if (config_.postfit_outlier_chi2 == 0.0 ||
+          normalizedSquaredResidual(first_pass, association, config_) <=
+              config_.postfit_outlier_chi2) {
+        retained.push_back(association);
+      } else {
+        ++rejected_postfit;
+      }
+    }
+    if (retained.size() >= 3 && retained.size() != associations.size()) {
+      graph = buildGraph(retained);
+      result = gtsam::LevenbergMarquardtOptimizer(graph, result, parameters).optimize();
+      associations = std::move(retained);
+      stats.rejected_postfit = rejected_postfit;
+    }
+    stats.used_measurements = associations.size();
+    stats.final_error = graph.error(result);
+    optimized_controls.reserve(control_lio.size());
+    for (size_t index = 0; index < control_lio.size(); ++index) {
+      optimized_controls.push_back(
+          {control_lio[index].stamp, toTransform(result.at<gtsam::Pose3>(index))});
+    }
+    optimized = applyInterpolatedCorrections(lio, control_lio, optimized_controls);
   } catch (const std::exception& error) {
     if (message) *message = std::string("GTSAM optimization failed: ") + error.what();
     return false;
   }
 
-  const ResidualStats after = residualStats(optimized, associations);
+  const ResidualStats after = residualStats(
+      optimized_controls, associations, config_.gnss_lever_arm_body_m);
   stats.optimized_horizontal_rmse_m = after.horizontal_rmse;
   stats.optimized_3d_rmse_m = after.three_dimensional_rmse;
   if (message) {
     std::ostringstream stream;
-    stream << "Optimized " << optimized.size() << " LIO poses with "
+    stream << "Optimized " << stats.control_poses << " control poses and expanded to "
+           << optimized.size() << " LIO poses with "
            << stats.used_measurements << " GNSS factors; horizontal RMSE "
            << stats.initial_horizontal_rmse_m << " -> "
            << stats.optimized_horizontal_rmse_m << " m.";

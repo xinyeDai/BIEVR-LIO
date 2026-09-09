@@ -87,13 +87,26 @@ target_link_libraries(bievr_pole_extractor
 add_executable(process_topics src/process_topics.cpp)
 add_executable(process_bag src/process_bag.cpp)
 add_executable(gnss_optimize src/gnss_optimize.cpp)
+# In an isolated workspace a stale merged devel/include can precede the freshly
+# exported plain-CMake package. Prefer this repository's matching public header
+# for the GNSS executable; the linked implementation still comes from the
+# exported bievr_pgo target.
+target_include_directories(gnss_optimize BEFORE PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../modules/pgo/include
+)
 
 add_dependencies(gnss_optimize ${catkin_EXPORTED_TARGETS})
 target_link_libraries(gnss_optimize
   ${catkin_LIBRARIES}
   bievr_lio::bievr_lio
+  bievr_ros_common::bievr_ros_common
   bievr_pgo::bievr_pgo
 )
+if(livox_ros_driver_FOUND)
+  target_compile_definitions(gnss_optimize PRIVATE BIEVR_WITH_LIVOX)
+  target_include_directories(gnss_optimize PRIVATE ${livox_ros_driver_INCLUDE_DIRS})
+  target_link_libraries(gnss_optimize ${livox_ros_driver_LIBRARIES})
+endif()
 if(UNIX AND NOT APPLE)
   target_link_options(gnss_optimize PRIVATE "-Wl,--disable-new-dtags")
   set_target_properties(gnss_optimize PROPERTIES INSTALL_RPATH "$ORIGIN/..")
