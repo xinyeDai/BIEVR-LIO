@@ -9,6 +9,7 @@
 
 #include "bievr_lio/config_loader.h"
 #include "bievr_lio_ros/loop_closure.h"
+#include "bievr_lio_ros/pole_extractor.h"
 #include "bievr_lio_ros/publisher.h"
 #include "bievr_lio_ros/save_map_service.h"
 #include "bievr_ros_common/conversions.h"
@@ -46,6 +47,13 @@ int main(int argc, char** argv) {
 
   bievr::Publisher lio_pub(nh, pipeline, "bievr_lio");
   bievr::SaveMapService save_map_service(private_nh, pipeline);
+  bievr::PoleExtractionConfig pole_config;
+  if (!bievr::loadPoleExtractionConfig(config.yaml_paths, pole_config)) return -1;
+  std::unique_ptr<bievr::PoleExtractor> pole_extractor;
+  if (pole_config.enable) {
+    pole_extractor.reset(
+        new bievr::PoleExtractor(nh, pipeline, pole_config, "bievr_lio"));
+  }
   bievr::LoopClosureConfig loop_config;
   if (!bievr::loadLoopClosureConfig(config.yaml_paths, loop_config)) return -1;
   std::unique_ptr<bievr::LoopClosure> loop_closure;
@@ -99,6 +107,21 @@ int main(int argc, char** argv) {
   LOG(I, "Bag closed");
 
   int exit_code = 0;
+  if (pole_extractor) {
+    pole_extractor->finish();
+    std::string message;
+    if (!pole_extractor->saveResults(&message)) {
+      LOG(E, message);
+      exit_code = -1;
+    } else {
+      LOG(I, message);
+    }
+    const auto stats = pole_extractor->stats();
+    LOG(I, "Pole extraction summary: " << stats.processed_keyframes << " keyframes, "
+                                        << stats.detections << " detections, " << stats.landmarks
+                                        << " merged landmarks, " << stats.dropped_keyframes
+                                        << " dropped keyframes.");
+  }
   if (!pipeline->saveResults()) {
     LOG(E, "One or more final outputs could not be saved.");
     exit_code = -1;

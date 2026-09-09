@@ -159,6 +159,10 @@ rosbag play /absolute/path/to/data.bag
 | `Log/trajectory.obj` | OBJ 折线轨迹，可由 MeshLab、Blender 等软件打开 |
 | `Log/odometry_tum.txt` | TUM 格式里程计，字段为 `timestamp tx ty tz qx qy qz qw` |
 | `Log/localization_tum.txt` | Localization 模式输出的地图坐标系定位轨迹；只有成功定位后才生成 |
+| `Log/poles/landmarks.txt` | 去重后的支柱坐标、柱轴、观测次数、拟合半径和 RMS |
+| `Log/poles/detections.txt` | 每次检测的柱轴、半径、RMS、内点率、角度覆盖率等拟合质量指标 |
+| `Log/poles/landmarks.pcd` | 去重后的支柱中心点云，`intensity` 表示观测次数 |
+| `Log/poles/keyframe_XXXXXX_poles.pcd` | 每个支柱关键帧中通过细过滤的竖直支柱点 |
 
 当前 `config/params.yaml` 使用绝对路径，所有结果固定保存到项目目录：
 
@@ -168,6 +172,64 @@ ls -lh /home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log
 
 保存点云要求 `config/params.yaml` 中的 `map_save.accumulate` 保持为
 `True`。如果程序被 `kill -9` 强制终止，则退出保存逻辑无法执行。
+
+### 铁路支柱提取
+
+`config/params.yaml` 的 `pole_extraction` 段控制在线支柱提取。模块直接接收
+SLAM 内部同一时刻的去畸变点云和位姿，每 `frames_per_keyframe` 帧组成一个
+非重叠支柱关键帧，并在后台执行轨道 ROI、二维栅格高度连续性检测、形态学
+连通域过滤和欧式聚类。粗筛后参考 SE-LIO，通过 PCA 估计柱轴，将候选点投影
+到柱轴法平面，再用 RANSAC 和最小二乘拟合截面圆；轴倾角、拟合半径、全点
+径向 RMS、内点率和角度覆盖率共同决定候选是否保留。支柱坐标是拟合柱轴与
+`trajectory_z + center_z_offset_m` 高程平面的交点。它不会通过 ROS 重新同步
+点云和里程计。
+
+运行时可在 RViz 中订阅：
+
+- `/bievr_lio/poles/centers`：当前支柱关键帧的中心；
+- `/bievr_lio/poles/points`：当前关键帧通过细过滤的支柱点；
+- `/bievr_lio/poles/map`：跨关键帧合并后的支柱中心地图。
+- `/bievr_lio/poles/markers`：累计支柱的拟合柱体、柱轴、基点和文字 ID。
+
+随包提供的 RViz 配置已经启用支柱显示：青色点是实际被提取的点，半透明绿色
+圆柱是拟合模型，黄色箭头是柱轴，红色球是输出坐标，文字包含支柱 ID、观测
+次数、半径和 RMS。在线运行或希望边处理边看时使用：
+
+```bash
+roslaunch bievr_lio_ros process_topics.launch rviz:=true
+```
+
+离线 `process_bag` 通常很快结束，处理完成后推荐直接查看保存结果：
+
+```bash
+python3 scripts/visualize_poles.py
+```
+
+查看器会加载 `Log/map.pcd` 和 `Log/poles/`。也可以导出一个带颜色的点云，供
+CloudCompare 或 MeshLab 打开：
+
+```bash
+python3 scripts/visualize_poles.py --no-gui \
+  --export Log/poles/poles_visualization.ply \
+  --overview Log/poles/poles_overview.png
+```
+
+襄阳铁路 bag 可直接使用 `xiangyang` 传感器配置，例如：
+
+```bash
+roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
+  rosbag:="/mnt/e/Data/襄阳铁路数据-第二次数据/2026-01-13_襄阳金鹰重工_焦柳线_郜营-余家湖/20260113/bag20260113_1.bag"
+```
+
+默认参数以约 10 Hz 的 Livox 数据为基准，50 帧组成约 5 秒的支柱关键帧。
+其他帧率应相应修改 `frames_per_keyframe`；提取跟不上时会丢弃最老的待处理
+支柱关键帧，但不会阻塞里程计，最终统计会报告丢弃数。
+
+论文面向树干使用的 `0.05 m` 拟合误差在铁路格构柱、方柱和局部遮挡条件下
+偏严；襄阳数据默认使用 `cylinder_inlier_threshold_m: 0.10`、
+`cylinder_max_rms_m: 0.20` 和 `cylinder_min_inlier_ratio: 0.35`。铁路刚性支柱
+默认 `cylinder_max_piecewise_depth: 0`；只有需要拟合弯曲柱体时才建议设为
+`1`。跨关键帧地图会同时检查中心距离、柱轴夹角和半径差，减少相邻目标误合并。
 
 launch 文件只负责选择配置文件、数据和 RViz，不会覆盖算法参数。运行模式
 统一在 `config/params.yaml` 中设置：

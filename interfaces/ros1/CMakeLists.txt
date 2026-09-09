@@ -14,6 +14,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   sensor_msgs
+  visualization_msgs
   std_msgs
   nav_msgs
   tf
@@ -52,9 +53,11 @@ endif()
 
 catkin_package(
   INCLUDE_DIRS include
+  LIBRARIES bievr_pole_extractor
   CATKIN_DEPENDS
     roscpp
     sensor_msgs
+    visualization_msgs
     std_msgs
     nav_msgs
     tf
@@ -69,10 +72,15 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
-# The wrapper is now header-only apart from the two executables (conversions,
-# publisher and config loading all live in headers shared via bievr_ros_common),
-# so there is no library to build -- the executables link the dependencies
-# directly.
+add_library(bievr_pole_extractor src/pole_extractor.cpp)
+add_dependencies(bievr_pole_extractor ${catkin_EXPORTED_TARGETS})
+target_link_libraries(bievr_pole_extractor
+  ${catkin_LIBRARIES}
+  bievr_lio::bievr_lio
+  bievr_ros_common::bievr_ros_common
+  ${YAML_CPP_LIBRARIES}
+)
+
 add_executable(process_topics src/process_topics.cpp)
 add_executable(process_bag src/process_bag.cpp)
 
@@ -85,6 +93,7 @@ foreach(target process_topics process_bag)
     bievr_ros_common::bievr_ros_common
     bievr_pgo::bievr_pgo
     bievr_localization::bievr_localization
+    bievr_pole_extractor
     ${YAML_CPP_LIBRARIES}
     TBB::tbb
   )
@@ -102,7 +111,7 @@ foreach(target process_topics process_bag)
   endif()
 endforeach()
 
-install(TARGETS process_bag process_topics
+install(TARGETS bievr_pole_extractor process_bag process_topics
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}

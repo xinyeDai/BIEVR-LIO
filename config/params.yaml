@@ -28,6 +28,63 @@ map_save: # 此处保存纯里程计地图，不是回环优化地图；回环�
   resolution_m: 0.1 # 纯里程计累计点云的体素分辨率 [m]
   path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/map.pcd" # 纯里程计地图的保存路径
 
+# 在线支柱提取：直接使用 LIO 的去畸变点云和同步位姿，在后台将若干扫描组成
+# 一个非重叠关键帧。先复用 scripts/coarse_extraction.py 的粗筛，再做圆柱拟合。
+pole_extraction:
+  enable: True
+
+  # 关键帧与后台队列。当前 Livox 数据约 10 Hz，50 帧约为 5 秒点云。
+  frames_per_keyframe: 50
+  process_partial_keyframe: True # 退出时也处理最后一个未满关键帧
+  min_partial_frames: 10
+  max_queue: 3 # 提取跟不上时丢弃最老的待处理关键帧，避免阻塞里程计
+  input_voxel_resolution_m: 0.10
+
+  # 相对轨迹的铁路走廊 ROI；左侧为正 Y。
+  use_roi: True
+  roi_y_min_m: -10.0
+  roi_y_max_m: 10.0
+  roi_z_min_m: -5.0
+  roi_z_max_m: 10.0
+
+  # 二维栅格粗提取与垂直高度层连续性。
+  grid_resolution_m: 0.5
+  min_points_per_cell: 60
+  min_height_span_m: 8.0
+  layer_resolution_m: 0.2
+  min_continuous_layers: 40
+  max_component_cells: 8
+
+  # 欧式聚类和支柱形状过滤。
+  cluster_tolerance_m: 1.0
+  max_xy_span_m: 1.0
+  min_cluster_points: 50
+  max_cluster_points: 5000
+
+  # SE-LIO 思路的柱轴与截面圆拟合（仅处理已通过粗筛的候选聚类）。
+  cylinder_fit_enable: True
+  cylinder_ransac_iterations: 128
+  cylinder_inlier_threshold_m: 0.10
+  cylinder_min_inlier_ratio: 0.35
+  cylinder_max_rms_m: 0.20
+  cylinder_min_radius_m: 0.08
+  cylinder_max_radius_m: 0.80
+  cylinder_max_axis_tilt_deg: 5.0
+  cylinder_min_angular_coverage: 0.25
+  # 铁路支柱通常为刚体直柱，默认不递归分段；弯曲目标可设为 1。
+  cylinder_max_piecewise_depth: 0
+  cylinder_min_segment_points: 80
+
+  # 拟合柱轴与该基准高程平面的交点作为支柱坐标。
+  center_z_offset_m: -5.0
+
+  # 同一支柱按位置、柱轴方向和半径联合合并。
+  landmark_merge_radius_m: 1.0
+  landmark_max_axis_angle_deg: 5.0
+  landmark_max_radius_difference_m: 0.30
+  output_directory: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/poles"
+  save_keyframe_clouds: True # 保存 keyframe_XXXXXX_poles.pcd，便于逐关键帧复核
+
 loop_closure: # 位于里程计后端的 Scan Context + GTSAM 位姿图回环模块
   enable: False # 建图时设为 True；纯里程计或定位时设为 False
 
