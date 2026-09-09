@@ -1,0 +1,24 @@
+<launch>
+  <!-- Run LIO first, then feed its odometry_tum.txt and the same bag here. -->
+  <arg name="bag" />
+  <arg name="lio_trajectory" />
+  <arg name="output_directory" default="$(find bievr_lio_ros)/../../../Log/gnss_optimization" />
+  <arg name="gnss_topic" default="/gnss" />
+
+  <node pkg="bievr_lio_ros" type="gnss_optimize" name="bievr_gnss_optimize"
+        output="screen">
+    <param name="bag" value="$(arg bag)" />
+    <param name="lio_trajectory" value="$(arg lio_trajectory)" />
+    <param name="output_directory" value="$(arg output_directory)" />
+    <param name="gnss_topic" value="$(arg gnss_topic)" />
+    <param name="max_time_gap_s" value="0.20" />
+    <param name="horizontal_sigma_floor_m" value="0.05" />
+    <param name="vertical_sigma_floor_m" value="0.10" />
+    <param name="gnss_huber_delta" value="2.5" />
+    <param name="initial_outlier_gate_m" value="3.0" />
+    <param name="odom_rotation_sigma_deg_per_sqrt_m" value="0.02" />
+    <param name="odom_translation_sigma_m_per_sqrt_m" value="0.02" />
+    <param name="minimum_edge_distance_m" value="0.10" />
+    <param name="max_iterations" value="100" />
+  </node>
+</launch>

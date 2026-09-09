@@ -431,7 +431,6 @@ bool Pipeline::saveResults(const std::string& log_dir) {
     success = saveMap((output_dir / "map.pcd").string()) && success;
   } else {
     LOG(W, "Skipping final map: map accumulation is disabled.");
-    success = false;
   }
 
   const fs::path obj_path = output_dir / "trajectory.obj";

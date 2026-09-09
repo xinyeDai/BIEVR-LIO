@@ -25,7 +25,10 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
   CXX_STANDARD_REQUIRED ON
   CXX_EXTENSIONS OFF
 )
-target_compile_options(${PROJECT_NAME} PRIVATE $<$<CONFIG:Release>:-O3>)
+target_compile_options(${PROJECT_NAME} PRIVATE
+  $<$<CONFIG:Release>:-O3>
+  $<$<CXX_COMPILER_ID:GNU>:-march=native>
+)
 
 target_link_libraries(${PROJECT_NAME} PUBLIC Eigen3::Eigen)
 

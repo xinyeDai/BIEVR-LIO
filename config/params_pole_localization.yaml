@@ -1,0 +1,32 @@
+# 本文件叠加在 params.yaml 之后，启用不加载稠密 PCD、不运行 GICP 的
+# “LIO + 支柱地图”定位模式。
+map_save:
+  accumulate: False
+
+loop_closure:
+  enable: False
+
+localization:
+  enable: False
+
+pole_extraction:
+  enable: True
+  localization_enable: True
+  localization_guided_roi: True
+  localization_guided_roi_radius_m: 5.0
+  localization_guided_roi_max_range_m: 40.0
+  localization_map_path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/poles/landmarks.txt"
+  localization_map_frame: "map"
+  output_directory: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/poles_localization"
+  save_keyframe_clouds: False
+
+  # 正常运行由 /initialpose、已知起点或 GNSS 提供初值。只有确认两次 odom
+  # 共原点时，才把此项改成 True 并填写下面的手工初值。
+  localization_use_initial_guess: False
+  localization_initial_translation: [0.0, 0.0, 0.0]
+  localization_initial_yaw_deg: 0.0
+
+pole_localization:
+  enable: True
+  map_frame: "map"
+  output_directory: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/pole_localization"

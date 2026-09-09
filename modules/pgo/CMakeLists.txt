@@ -28,7 +28,10 @@ find_package(bievr_scancontext REQUIRED)
 find_package(bievr_map_io REQUIRED)
 find_package(small_gicp REQUIRED)
 
-add_library(${PROJECT_NAME} src/loop_closer.cpp)
+add_library(${PROJECT_NAME}
+  src/loop_closer.cpp
+  src/gnss_optimizer.cpp
+)
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
 
 target_include_directories(${PROJECT_NAME} PUBLIC

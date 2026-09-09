@@ -12,6 +12,7 @@
 #include "bievr_lio_ros/localization.h"
 #include "bievr_lio_ros/loop_closure.h"
 #include "bievr_lio_ros/pole_extractor.h"
+#include "bievr_lio_ros/pole_localization.h"
 #include "bievr_lio_ros/publisher.h"
 #include "bievr_lio_ros/save_map_service.h"
 #include "bievr_ros_common/conversions.h"
@@ -50,27 +51,63 @@ int main(int argc, char** argv) {
 
   bievr::PoleExtractionConfig pole_config;
   if (!bievr::loadPoleExtractionConfig(config.yaml_paths, pole_config)) return -1;
+  bievr::LoopClosureConfig loop_config;
+  if (!bievr::loadLoopClosureConfig(config.yaml_paths, loop_config)) return -1;
+  bievr::LocalizationConfig localization_config;
+  if (!bievr::loadLocalizationConfig(config.yaml_paths, localization_config)) return -1;
+  bievr::PoleLocalizationConfig pole_localization_config;
+  if (!bievr::loadPoleLocalizationConfig(config.yaml_paths, pole_localization_config)) return -1;
+
+  const bool dense_localization_mode = localization_config.enable;
+  const bool pole_localization_mode = pole_localization_config.enable;
+  if (dense_localization_mode && pole_localization_mode) {
+    LOG(E, "Relocalization modes are mutually exclusive: enable either dense-map "
+           "localization or pole-map localization, not both.");
+    return -1;
+  }
+  if ((dense_localization_mode || pole_localization_mode) && loop_config.enable) {
+    LOG(E, "loop_closure cannot run together with either relocalization mode.");
+    return -1;
+  }
+  if (dense_localization_mode && pole_config.enable) {
+    LOG(E, "Dense-map relocalization is dense-only; set pole_extraction.enable to false.");
+    return -1;
+  }
+  if (pole_config.localization_enable && !pole_localization_mode) {
+    LOG(E, "pole_extraction.localization_enable is only valid in pole-map "
+           "relocalization mode.");
+    return -1;
+  }
+  if (pole_localization_mode &&
+      (!pole_config.enable || !pole_config.localization_enable)) {
+    LOG(E, "Pole-map relocalization requires pole_extraction.enable and "
+           "pole_extraction.localization_enable.");
+    return -1;
+  }
+  if (pole_localization_mode &&
+      pole_localization_config.map_frame != pole_config.localization_map_frame) {
+    LOG(E, "pole_localization.map_frame must match "
+           "pole_extraction.localization_map_frame.");
+    return -1;
+  }
+  if (dense_localization_mode) {
+    LOG(I, "Relocalization mode: DENSE_MAP_ONLY (GICP, pole modules disabled).");
+  } else if (pole_localization_mode) {
+    LOG(I, "Relocalization mode: POLE_MAP_ONLY (no dense map or GICP).");
+  }
+
   std::unique_ptr<bievr::PoleExtractor> pole_extractor;
   if (pole_config.enable) {
     pole_extractor.reset(
         new bievr::PoleExtractor(nh, pipeline, pole_config, "bievr_lio"));
+    if (!pole_extractor->localizationReady()) return -1;
   }
-
-  bievr::LoopClosureConfig loop_config;
-  if (!bievr::loadLoopClosureConfig(config.yaml_paths, loop_config)) return -1;
   std::unique_ptr<bievr::LoopClosure> loop_closure;
   if (loop_config.enable) {
     loop_closure.reset(new bievr::LoopClosure(nh, private_nh, pipeline, loop_config, "bievr_lio"));
   }
-
-  bievr::LocalizationConfig localization_config;
-  if (!bievr::loadLocalizationConfig(config.yaml_paths, localization_config)) return -1;
   std::unique_ptr<bievr::Localization> localization;
-  if (localization_config.enable) {
-    if (loop_config.enable) {
-      LOG(E, "loop_closure and localization cannot be enabled at the same time.");
-      return -1;
-    }
+  if (dense_localization_mode) {
     localization.reset(
         new bievr::Localization(nh, pipeline, localization_config, "bievr_lio"));
     std::string message;
@@ -78,6 +115,17 @@ int main(int argc, char** argv) {
       LOG(E, "Failed to start localization: " << message);
       return -1;
     }
+  }
+  std::unique_ptr<bievr::PoleLocalization> pole_localization;
+  if (pole_localization_mode) {
+    pole_localization.reset(new bievr::PoleLocalization(
+        nh, pipeline, pole_localization_config, "bievr_lio"));
+    pole_extractor->setCorrectionProvider(
+        [&pole_localization]() { return pole_localization->correction(); });
+    pole_extractor->setCorrectionObserver(
+        [&pole_localization](const bievr::PoleLocalizationCorrection& correction) {
+          pole_localization->addPoleCorrection(correction);
+        });
   }
 
   ros::Subscriber pointcloud_sub = nh.subscribe<topic_tools::ShapeShifter>(
@@ -157,6 +205,17 @@ int main(int argc, char** argv) {
                                         << stats.detections << " detections, " << stats.landmarks
                                         << " merged landmarks, " << stats.dropped_keyframes
                                         << " dropped keyframes.");
+    if (pole_config.localization_enable) {
+      LOG(I, "Pole localization summary: " << stats.localization_accepted << "/"
+                                             << stats.localization_attempts
+                                             << " corrections accepted.");
+    }
+    if (pole_config.rail_enable) {
+      LOG(I, "Rail-vector summary: " << stats.rail_samples << " samples, "
+                                      << stats.rail_localization_accepted << "/"
+                                      << stats.rail_localization_attempts
+                                      << " vertical corrections accepted.");
+    }
   }
   if (!pipeline->saveResults()) {
     LOG(E, "One or more final outputs could not be saved.");
@@ -195,6 +254,24 @@ int main(int argc, char** argv) {
     } else {
       LOG(I, message);
     }
+    const auto stats = localization->stats();
+    LOG(I, "Localization summary: " << stats.accepted << "/" << stats.attempts
+                                     << " GICP matches accepted.");
+  }
+  if (pole_localization) {
+    std::string message;
+    if (!pole_localization->saveResults(&message)) {
+      LOG(E, message);
+      exit_code = -1;
+    } else {
+      LOG(I, message);
+    }
+    const auto stats = pole_localization->stats();
+    LOG(I, "Pole-only localization summary: " << stats.accepted << "/"
+                                                << stats.measurements
+                                                << " filtered updates accepted, "
+                                                << stats.localized_frames
+                                                << " localized LIO frames.");
   }
 
   return exit_code;

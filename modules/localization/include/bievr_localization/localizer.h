@@ -102,7 +102,10 @@ class Localizer {
     double last_fitness = 0.0;
   };
 
-  explicit Localizer(Config config);
+  // Construct inside the localization library. Localizer owns several
+  // third-party template types whose layout may otherwise depend on the
+  // include set used by a ROS consumer.
+  static std::unique_ptr<Localizer> create(Config config);
   ~Localizer();
 
   Localizer(const Localizer&) = delete;
@@ -135,6 +138,8 @@ class Localizer {
   uint64_t mapGeneration() const;
 
  private:
+  explicit Localizer(Config config);
+
   struct PendingFrame {
     uint64_t stamp = 0;
     Transform T_odom_body;

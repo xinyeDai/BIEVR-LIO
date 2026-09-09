@@ -28,6 +28,16 @@ map_save: # 此处保存纯里程计地图，不是回环优化地图；回环�
   resolution_m: 0.1 # 纯里程计累计点云的体素分辨率 [m]
   path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/map.pcd" # 纯里程计地图的保存路径
 
+# 本文件作为 params.yaml 的稠密点云重定位覆盖层使用。该模式只运行
+# Localizer/GICP，不提取支柱，也不读取 landmarks.txt。
+pole_extraction:
+  enable: False
+  localization_enable: False
+  save_keyframe_clouds: False
+
+pole_localization:
+  enable: False
+
 loop_closure: # 位于里程计后端的 Scan Context + GTSAM 位姿图回环模块
   enable: False # 建图时设为 True；纯里程计或定位时设为 False
 
@@ -56,7 +66,7 @@ loop_closure: # 位于里程计后端的 Scan Context + GTSAM 位姿图回环模
   # 地图包包含点云、优化后位姿和 Scan Context 数据库
   bundle_path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/bievr_map_bundle"
 
-localization: # 位于里程计后端的先验地图定位模块
+localization: # 唯一启用的重定位模块：稠密点云地图 + GICP
   enable: True # 定位时设为 True，同时确保 loop_closure.enable 为 False
 
   # 地图包支持自动重定位；单独的 PCD 地图需要通过 /initialpose 提供初始位姿

@@ -6,7 +6,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -18,11 +20,22 @@ struct PoleExtractionConfig {
   bool enable = false;
 
   // Keyframe construction and background work queue.
+  // A keyframe is emitted after traveling keyframe_distance, or when the
+  // maximum frame count is reached. A small overlap avoids boundary misses.
   size_t frames_per_keyframe = 50;
+  size_t min_frames_per_keyframe = 20;
+  double keyframe_distance = 30.0;
+  size_t keyframe_overlap_frames = 5;
   bool process_partial_keyframe = true;
   size_t min_partial_frames = 10;
   size_t max_queue = 3;
   double input_voxel_size = 0.10;
+
+  // Optional mapping-only pose source. A GNSS/PGO trajectory can be replayed
+  // so accumulated scans and saved poles use its world frame. Query-time pole
+  // localization deliberately continues to use only live LIO poses.
+  std::string mapping_trajectory_path;
+  double mapping_trajectory_max_time_gap_s = 0.20;
 
   // Track-relative region of interest.
   bool use_roi = true;
@@ -69,14 +82,101 @@ struct PoleExtractionConfig {
 
   std::string output_directory = "Log/poles";
   bool save_keyframe_clouds = true;
+
+  // Match a rolling local pole map against landmarks saved by a mapping run.
+  // The result is an SE(2) refinement of T_map_odom; z/roll/pitch are retained
+  // from the supplied initial correction.
+  bool localization_enable = false;
+  std::string localization_map_path;
+  std::string localization_map_frame = "map";
+  size_t localization_window_keyframes = 7;
+  double localization_match_distance = 4.0;
+  // Extend the extraction ROI only around predicted prior axes. Return runs
+  // can see the same poles from a neighbouring track outside the normal ROI.
+  bool localization_guided_roi = true;
+  double localization_guided_roi_radius = 5.0;
+  double localization_guided_roi_max_range = 40.0;
+  double localization_radius_difference = 0.30;
+  double localization_axis_angle_deg = 5.0;
+  int localization_min_matches = 3;
+  double localization_min_match_ratio = 0.60;
+  double localization_min_baseline = 10.0;
+  double localization_max_rms = 0.50;
+  double localization_huber_delta = 0.50;
+  double localization_max_translation_step = 5.0;
+  double localization_max_yaw_step_deg = 5.0;
+  bool localization_use_initial_guess = false;
+  V3 localization_initial_translation = V3::Zero();
+  double localization_initial_yaw_deg = 0.0;
+  bool localization_initial_orientation_enable = false;
+  Quaternion localization_initial_orientation = Quaternion::Identity();
+
+  // Rail-vector extraction reuses exactly the same accumulated keyframes.
+  // Each accepted cross section contributes a paired left/right rail-top
+  // control point. The saved polyline map is sparse; no dense cloud is needed
+  // in the localization run.
+  bool rail_enable = false;
+  double rail_station_resolution = 0.40;
+  double rail_lateral_resolution = 0.05;
+  double rail_lateral_min = -3.0;
+  double rail_lateral_max = 3.0;
+  double rail_relative_z_min = -5.30;
+  double rail_relative_z_max = -3.40;
+  double rail_nominal_gauge = 1.435;
+  double rail_min_gauge = 1.20;
+  double rail_max_gauge = 1.80;
+  int rail_min_cell_points = 1;
+  double rail_min_prominence = 0.035;
+  double rail_max_lateral_jump = 0.30;
+  double rail_max_vertical_jump = 0.15;
+  double rail_max_cross_level = 0.20;
+  size_t rail_min_segment_samples = 12;
+  std::string rail_map_path;
+  double rail_match_distance = 2.0;
+  double rail_max_tangent_angle_deg = 12.0;
+  size_t rail_min_matches = 10;
+  double rail_min_baseline = 8.0;
+  double rail_huber_delta = 0.08;
+  double rail_max_rms = 0.12;
+  double rail_max_z_step = 1.0;
+  double rail_max_tilt_step_deg = 2.0;
+  bool rail_update_roll = false;
+  bool rail_update_pitch = true;
 };
 
 struct PoleExtractionStats {
   size_t received_frames = 0;
   size_t processed_keyframes = 0;
   size_t dropped_keyframes = 0;
+  size_t rejected_trajectory_frames = 0;
   size_t detections = 0;
   size_t landmarks = 0;
+  size_t localization_attempts = 0;
+  size_t localization_accepted = 0;
+  size_t rail_samples = 0;
+  size_t rail_localization_attempts = 0;
+  size_t rail_localization_accepted = 0;
+};
+
+struct PoleLocalizationCorrection {
+  Transform T_map_odom = Transform::Identity();
+  uint64_t stamp = 0;
+  // Cumulative planar LIO travel at stamp. This lets the localization filter
+  // propagate covariance in sensor-time order instead of worker wall time.
+  double odom_distance_m = 0.0;
+  size_t matches = 0;
+  double match_ratio = 0.0;
+  double baseline = 0.0;
+  double rms = 0.0;
+  // Pole corrections constrain x/y/yaw. Rail corrections constrain
+  // z/roll/pitch. Keeping the masks explicit prevents a straight rail from
+  // injecting an unobservable along-track displacement.
+  bool constrain_planar = true;
+  bool constrain_vertical = false;
+  bool constrain_z = false;
+  bool constrain_roll = false;
+  bool constrain_pitch = false;
+  bool valid = false;
 };
 
 // Reads pole_extraction: from the same layered YAML files as the LIO config.
@@ -100,6 +200,15 @@ class PoleExtractor {
   bool saveResults(std::string* message = nullptr) const;
 
   PoleExtractionStats stats() const;
+
+  // Pole-only localization refines its previous filtered correction or a
+  // configured/manual seed. Dense-map localization is deliberately separate.
+  using CorrectionProvider = std::function<std::optional<Transform>()>;
+  using CorrectionObserver = std::function<void(const PoleLocalizationCorrection&)>;
+  void setCorrectionProvider(CorrectionProvider provider);
+  void setCorrectionObserver(CorrectionObserver observer);
+  PoleLocalizationCorrection localizationCorrection() const;
+  bool localizationReady() const;
 
  private:
   class Impl;

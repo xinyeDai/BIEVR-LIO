@@ -131,7 +131,7 @@ roslaunch bievr_lio_ros process_bag.launch
 ```
 
 程序会直接读取 bag，不需要另外执行 `rosbag play`。`sensor_config` 可选
-`enwide`、`ncd`、`gamma`、`mars`、`grandtour`，也可以传入自定义 YAML
+`enwide`、`ncd`、`gamma`、`mars`、`grandtour`、`xiangyang`、`tzb`，也可以传入自定义 YAML
 配置文件的绝对路径。
 
 在线处理雷达和 IMU 话题前，编辑
@@ -162,9 +162,15 @@ rosbag play /absolute/path/to/data.bag
 | `Log/poles/landmarks.txt` | 去重后的支柱坐标、柱轴、观测次数、拟合半径和 RMS |
 | `Log/poles/detections.txt` | 每次检测的柱轴、半径、RMS、内点率、角度覆盖率等拟合质量指标 |
 | `Log/poles/landmarks.pcd` | 去重后的支柱中心点云，`intensity` 表示观测次数 |
+| `Log/poles/rail_vector_map.txt` | 左右轨顶三维控制点、线路切向、轨距和提取质量 |
 | `Log/poles/keyframe_XXXXXX_poles.pcd` | 每个支柱关键帧中通过细过滤的竖直支柱点 |
+| `Log/poles_localization/localization_corrections.txt` | 二次运行中通过验收的 `POLE/RAIL` 原始修正、LIO 累计里程、匹配数和 RMS |
+| `Log/pole_localization/localization_tum.txt` | 不使用稠密地图时，由支柱修正与每帧 LIO 组合得到的完整轨迹 |
+| `Log/pole_localization/filtered_corrections.txt` | 纯支柱定位每次滤波更新的原始/滤波修正、创新、马氏距离和协方差 |
+| `Log/pole_localization/summary.yaml` | 稀疏地图定位状态、支柱/轨道接受数、轨迹帧数和末次创新 |
 
-当前 `config/params.yaml` 使用绝对路径，所有结果固定保存到项目目录：
+当前 `config/params.yaml` 给出了项目目录下的绝对路径默认值；使用覆盖参数时，
+输出目录由最后一层 YAML 决定：
 
 ```bash
 ls -lh /home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log
@@ -176,13 +182,20 @@ ls -lh /home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log
 ### 铁路支柱提取
 
 `config/params.yaml` 的 `pole_extraction` 段控制在线支柱提取。模块直接接收
-SLAM 内部同一时刻的去畸变点云和位姿，每 `frames_per_keyframe` 帧组成一个
-非重叠支柱关键帧，并在后台执行轨道 ROI、二维栅格高度连续性检测、形态学
-连通域过滤和欧式聚类。粗筛后参考 SE-LIO，通过 PCA 估计柱轴，将候选点投影
-到柱轴法平面，再用 RANSAC 和最小二乘拟合截面圆；轴倾角、拟合半径、全点
-径向 RMS、内点率和角度覆盖率共同决定候选是否保留。支柱坐标是拟合柱轴与
-`trajectory_z + center_z_offset_m` 高程平面的交点。它不会通过 ROS 重新同步
-点云和里程计。
+SLAM 内部同一时刻的去畸变点云和位姿。行驶距离达到
+`keyframe_distance_m` 且至少积累 `min_frames_per_keyframe` 帧时生成支柱关键帧；
+低速或停车时由 `frames_per_keyframe` 限制最大帧数，相邻关键帧复用
+`keyframe_overlap_frames` 帧以减少窗口边界漏检。后台提取先把体素点投影到该
+关键帧的轨迹折线，按局部切向建立铁路走廊 ROI，再执行二维栅格高度连续性、
+形态学连通域过滤和欧式聚类。闭运算补出的栅格只用于连通判断，不会把桥接
+栅格中的杂点重新带入三维候选。
+
+粗筛后参考 SE-LIO，通过 PCA 估计柱轴，将候选点投影到柱轴法平面，再用
+RANSAC 和最小二乘拟合截面圆；轴倾角、拟合半径、全点径向 RMS、内点率和
+角度覆盖率共同决定候选是否保留。PCA 与圆拟合及其验收门限保持不变。单次
+观测的支柱坐标是拟合柱轴与 `trajectory_z + center_z_offset_m` 高程平面的
+交点；跨关键帧合并时使用拟合质量加权融合柱轴，最后再计算支柱基点，并限制
+同一关键帧中的观测与地标一对一匹配。它不会通过 ROS 重新同步点云和里程计。
 
 运行时可在 RViz 中订阅：
 
@@ -190,6 +203,9 @@ SLAM 内部同一时刻的去畸变点云和位姿，每 `frames_per_keyframe` �
 - `/bievr_lio/poles/points`：当前关键帧通过细过滤的支柱点；
 - `/bievr_lio/poles/map`：跨关键帧合并后的支柱中心地图。
 - `/bievr_lio/poles/markers`：累计支柱的拟合柱体、柱轴、基点和文字 ID。
+- `/bievr_lio/poles/prior_map`：二次定位所加载的历史支柱地图（洋红色）。
+- `/bievr_lio/poles/correction`：支柱估计的原始 `map <- odom` 修正坐标轴。
+- `/bievr_lio/poles/correction_filtered`：纯支柱定位滤波后的正式修正。
 
 随包提供的 RViz 配置已经启用支柱显示：青色点是实际被提取的点，半透明绿色
 圆柱是拟合模型，黄色箭头是柱轴，红色球是输出坐标，文字包含支柱 ID、观测
@@ -209,7 +225,7 @@ python3 scripts/visualize_poles.py
 CloudCompare 或 MeshLab 打开：
 
 ```bash
-python3 scripts/visualize_poles.py --no-gui \
+python3 scripts/visualize_poles.py --no-map --no-gui \
   --export Log/poles/poles_visualization.ply \
   --overview Log/poles/poles_overview.png
 ```
@@ -221,37 +237,200 @@ roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
   rosbag:="/mnt/e/Data/襄阳铁路数据-第二次数据/2026-01-13_襄阳金鹰重工_焦柳线_郜营-余家湖/20260113/bag20260113_1.bag"
 ```
 
-默认参数以约 10 Hz 的 Livox 数据为基准，50 帧组成约 5 秒的支柱关键帧。
-其他帧率应相应修改 `frames_per_keyframe`；提取跟不上时会丢弃最老的待处理
-支柱关键帧，但不会阻塞里程计，最终统计会报告丢弃数。
+默认参数以约 10 Hz 的 Livox 数据为基准：正常行驶每 30 m 生成关键帧，至少
+积累 20 帧；低速时最多积累 50 帧，并保留 5 帧重叠。其他帧率应相应修改
+`min_frames_per_keyframe`、`frames_per_keyframe` 和 `keyframe_overlap_frames`；
+提取跟不上时会丢弃最老的待处理支柱关键帧，但不会阻塞里程计，最终统计会
+报告丢弃数。
 
 论文面向树干使用的 `0.05 m` 拟合误差在铁路格构柱、方柱和局部遮挡条件下
 偏严；襄阳数据默认使用 `cylinder_inlier_threshold_m: 0.10`、
 `cylinder_max_rms_m: 0.20` 和 `cylinder_min_inlier_ratio: 0.35`。铁路刚性支柱
 默认 `cylinder_max_piecewise_depth: 0`；只有需要拟合弯曲柱体时才建议设为
-`1`。跨关键帧地图会同时检查中心距离、柱轴夹角和半径差，减少相邻目标误合并。
+`1`。跨关键帧地图会在共同高度比较两条拟合轴线，并同时检查轴线距离、柱轴
+夹角和半径差；匹配后按点数、内点率、角度覆盖率和拟合残差进行质量加权，
+减少斜柱基点外推误差和相邻目标误合并。
+
+将保存支柱用于第二次运行时，`PoleExtractor` 会对最近 7 个关键帧做质量加权
+融合，以轴线、轴角和半径门限生成候选，再用 Hungarian 完成一对一关联和 Huber
+`SE(2)` 优化。验收后的 `x/y/yaw` 修正直接进入纯支柱定位滤波器，不再传给
+GICP。参数、初值要求和完整设计参见
+[`doc/pole_landmark_localization.md`](doc/pole_landmark_localization.md)。离线验证器
+`scripts/validate_pole_localization.py` 可对两次提取结果注入可控位置/航向误差。
+
+bag 含 `sensor_msgs/NavSatFix` 时，可先用 GTSAM 后端把 LIO 轨迹优化到局部 ENU：
+
+```bash
+rosrun bievr_lio_ros gnss_optimize --bag data.bag \
+  --lio_trajectory Log/odometry_tum.txt --output_directory Log/gnss_optimization
+```
+
+首次支柱建图把输出的 `gnss_optimized_tum.txt` 填入
+`pole_extraction.mapping_trajectory_path`；第二次支柱定位必须清空该项，运行时
+只使用 LIO 和 `landmarks.txt`。节点还输出含完整初始四元数的
+`initial_correction.yaml`，完整流程和实测结果见上述设计文档。
+
+可选的 `rail_extraction` 会复用同一批支柱关键帧，按横断面显著性、软轨距和
+连续性提取左右轨顶，将稀疏三维折线保存为 `rail_vector_map.txt`。第二次运行加载
+该矢量地图，以鲁棒点到轨面残差补充 `z/pitch` 约束；支柱继续负责 `x/y/yaw`，
+查询阶段仍不加载 GNSS 或稠密点云。组合模式使用：
+
+```bash
+roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
+  params:=params params_overlay:=params_pole_rail_localization \
+  rosbag:="/absolute/path/to/bag.bag" rviz:=true
+```
+
+轨道观测和地图分别发布到 `/bievr_lio/rails/observed` 与
+`/bievr_lio/rails/map`。本数据的同源验证中，垂直 RMSE 从纯支柱的 `0.960 m`
+降至 `0.076 m`，pitch RMSE 从 `0.246 deg` 降至 `0.039 deg`；详细限制和指标见
+设计文档。
+
+#### 推荐的铁路数据完整流程
+
+以下命令以襄阳铁路数据为例。路径和输出目录可以替换，但建图阶段的
+`mapping_trajectory_path` 必须填写 GNSS 优化后的 TUM 轨迹，重定位阶段必须清空。
+
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/zsq/slam/bievr-slam/devel_isolated/setup.bash
+
+BAG="/mnt/e/Data/襄阳铁路数据-第二次数据/2026-01-13_襄阳金鹰重工_焦柳线_郜营-余家湖/20260113/bag20260113_1.bag"
+
+# 终端 1：保持 ROS master 运行
+roscore
+
+# 终端 2：继续执行下面的命令
+# 1. 先运行 LIO，得到 Log/odometry_tum.txt
+rosrun bievr_lio_ros process_bag \
+  --sensor_config_file config/sensor_configs/xiangyang.yaml \
+  --params_file config/params.yaml --bag "$BAG"
+
+# 2. 使用 /gnss 建立 GTSAM 优化轨迹和初始 map<-odom 变换
+rosrun bievr_lio_ros gnss_optimize --bag "$BAG" \
+  --lio_trajectory Log/odometry_tum.txt \
+  --output_directory Log/gnss_optimization
+```
+
+首次提取地图时，在 `config/params.yaml` 中设置：
+
+```yaml
+pole_extraction:
+  enable: true
+  localization_enable: false
+  mapping_trajectory_path: "/absolute/path/to/Log/gnss_optimization/gnss_optimized_tum.txt"
+
+rail_extraction:
+  enable: true
+```
+
+然后再次运行 `process_bag`。输出目录中会同时生成
+`landmarks.txt` 和 `rail_vector_map.txt`。建图阶段可以使用累计点云，也可以将
+`map_save.accumulate` 设为 `false`；轨道/支柱地图本身不依赖稠密 PCD。
+
+第二次运行前，编辑
+`config/params_pole_rail_localization.yaml` 中的 `localization_map_path`、
+`rail_extraction.map_path` 和输出目录，然后运行：
+
+```bash
+roslaunch bievr_lio_ros process_bag.launch \
+  sensor_config:=xiangyang \
+  params:=params params_overlay:=params_pole_rail_localization \
+  rosbag:="$BAG" rviz:=true
+```
+
+查询阶段只读取 `/livox/lidar` 和 `/imu/data`（或传感器配置中的 LiDAR/IMU 话题），
+不读取 `/gnss`，不加载 `map.pcd`，也不运行 GICP。若从中途开始运行，需要将
+`gnss_optimize` 输出的 `initial_correction.yaml` 内容作为最后一层参数，或者通过
+RViz `/initialpose` 提供初始位姿。
+
+GNSS 后端使用 GTSAM 优化 LIO 轨迹；轨道在线定位使用鲁棒小量最小二乘和独立的
+`z/roll/pitch` 滤波器，支柱在线定位使用 Hungarian 关联和 Huber `SE(2)`。轨道并
+不是稠密点云匹配的替代品，而是稀疏支柱地图模式中的连续高程/坡度约束。
+
+#### 评估和可视化
+
+相对于参考 TUM 轨迹计算水平、垂直、三维、yaw、roll 和 pitch 误差：
+
+```bash
+python3 scripts/evaluate_tum_against_reference.py \
+  --estimate Log/pole_rail_localization/localization_tum.txt \
+  --reference Log/gnss_optimization/gnss_optimized_tum.txt \
+  --output Log/pole_rail_localization/metrics.json
+```
+
+查看支柱和轨道矢量地图，并导出 CloudCompare/MeshLab 可读的 PLY：
+
+```bash
+python3 scripts/visualize_poles.py --no-map --no-gui \
+  --poles Log/poles \
+  --overview Log/poles/rail_overview.png \
+  --export Log/poles/rail_map_colored.ply
+```
+
+`visualize_poles.py` 检测到 `rail_vector_map.txt` 后会自动绘制左右轨；没有该文件
+时仍可只查看支柱地图。
+
+稠密点云重定位叠加 `params_localization.yaml`：
+
+```bash
+roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
+  params:=params params_overlay:=params_localization \
+  rosbag:="/absolute/path/to/bag.bag" rviz:=true
+```
+
+该模式关闭全部支柱模块，只加载稠密地图并运行 GICP。完全不加载 `map.pcd`、
+只使用 LIO 和 `landmarks.txt` 时，使用独立的纯支柱定位模式：
+
+```bash
+roslaunch bievr_lio_ros pole_localization.launch \
+  sensor_config:=xiangyang rviz:=true
+```
+
+离线复放使用：
+
+```bash
+roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
+  params:=params params_overlay:=params_pole_localization \
+  rosbag:="/absolute/path/to/bag.bag" rviz:=true
+```
+
+纯支柱模式发布与稠密定位相同的 `/bievr_lio/loc/odom`、`/bievr_lio/loc/path`、
+`map -> odom` TF 和 `/bievr_lio/loc/status`。默认等待 `/initialpose`；已知两次 LIO
+共原点时也可临时启用 `pole_extraction.localization_use_initial_guess`。支柱失配后
+状态按行驶距离从 `TRACKING` 变为 `DEGRADED/LOST`，但最后有效修正会保留，LIO
+局部轨迹不会被打断。后台提取得到的修正按关键帧传感器时间和累计里程进入滤波，
+离线高速回放时会回填修正对应的轨迹尾段，不受后台线程完成时刻影响。
 
 launch 文件只负责选择配置文件、数据和 RViz，不会覆盖算法参数。运行模式
-统一在 `config/params.yaml` 中设置：
+统一在参数文件中设置；两个重定位模式严格互斥，误将它们同时开启会直接退出：
 
 - 纯里程计：`loop_closure.enable: False`，`localization.enable: False`
 - 回环建图：`loop_closure.enable: True`，`localization.enable: False`；地图包
   默认输出到 `Log/bievr_map_bundle`
-- 地图定位：`loop_closure.enable: False`，`localization.enable: True`；默认加载
+- 稠密点云定位：`loop_closure.enable: False`，`localization.enable: True`，
+  `pole_extraction.enable: False`，`pole_localization.enable: False`；默认加载
   `Log/bievr_map_bundle`
+- 纯支柱定位：`loop_closure.enable: False`，`localization.enable: False`，
+  `pole_extraction.localization_enable: True`，`pole_localization.enable: True`
+- 支柱 + 轨道矢量定位：在纯支柱模式基础上设置 `rail_extraction.enable: True`，
+  或叠加 `params_pole_rail_localization.yaml`
 
 The launch files contain editable defaults for the sensor config, parameter file,
 bag path and RViz switch. Change those values at the top of the relevant launch
 file, then use the commands below without additional terminal arguments.
 
-Algorithm settings are not overridden by launch files. Configure each mode only
-in `config/params.yaml`:
+Algorithm settings are not overridden by launch files. Use `config/params.yaml`
+as the base and select exactly one localization overlay when relocalizing:
 
 - Odometry: `loop_closure.enable: False`, `localization.enable: False`
 - Mapping: `loop_closure.enable: True`, `localization.enable: False`; the default
   bundle output is `Log/bievr_map_bundle`
-- Localization: `loop_closure.enable: False`, `localization.enable: True`, and
-  load `Log/bievr_map_bundle` through `localization.map_path`
+- Dense-map localization (`config/params_localization.yaml`): `localization.enable: True`,
+  `pole_extraction.enable: False`, `pole_localization.enable: False`, and load
+  `Log/bievr_map_bundle` through `localization.map_path`
+- Pole-map localization (`config/params_pole_localization.yaml`): `localization.enable: False`,
+  `pole_extraction.localization_enable: True`, `pole_localization.enable: True`
 
 Process live topics:
 

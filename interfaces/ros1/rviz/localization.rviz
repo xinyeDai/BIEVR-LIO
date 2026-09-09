@@ -43,6 +43,63 @@ Visualization Manager:
       Alpha: 1
       Position Transformer: XYZ
       Decay Time: 0
+    - Class: rviz/PointCloud2
+      Name: Saved Pole Map
+      Enabled: true
+      Topic: /bievr_lio/poles/prior_map
+      Queue Size: 2
+      Style: Spheres
+      Size (Pixels): 5
+      Size (m): 0.35
+      Color Transformer: FlatColor
+      Color: 255; 0; 255
+      Alpha: 1
+      Position Transformer: XYZ
+      Decay Time: 0
+    - Class: rviz/PointCloud2
+      Name: Current Pole Centers
+      Enabled: true
+      Topic: /bievr_lio/poles/centers
+      Queue Size: 5
+      Style: Spheres
+      Size (Pixels): 5
+      Size (m): 0.25
+      Color Transformer: FlatColor
+      Color: 255; 40; 20
+      Alpha: 1
+      Position Transformer: XYZ
+      Decay Time: 0
+    - Class: rviz/MarkerArray
+      Name: Current Pole Models
+      Enabled: true
+      Marker Topic: /bievr_lio/poles/markers
+      Queue Size: 10
+    - Class: rviz/PointCloud2
+      Name: Saved Rail Vector Map
+      Enabled: true
+      Topic: /bievr_lio/rails/map
+      Queue Size: 2
+      Style: Spheres
+      Size (Pixels): 4
+      Size (m): 0.10
+      Color Transformer: FlatColor
+      Color: 40; 80; 255
+      Alpha: 1
+      Position Transformer: XYZ
+      Decay Time: 0
+    - Class: rviz/PointCloud2
+      Name: Current Rail Samples
+      Enabled: true
+      Topic: /bievr_lio/rails/observed
+      Queue Size: 5
+      Style: Spheres
+      Size (Pixels): 4
+      Size (m): 0.12
+      Color Transformer: FlatColor
+      Color: 255; 40; 20
+      Alpha: 1
+      Position Transformer: XYZ
+      Decay Time: 0
     - Class: rviz/Path
       Name: Localized Path
       Enabled: true
@@ -66,6 +123,30 @@ Visualization Manager:
         Axes Radius: 0.25
       Position Tolerance: 0.05
       Angle Tolerance: 0.05
+    - Class: rviz/Odometry
+      Name: Pole Map-Odom Correction
+      Enabled: true
+      Topic: /bievr_lio/poles/correction
+      Queue Size: 10
+      Keep: 1
+      Shape:
+        Value: Axes
+        Axes Length: 3
+        Axes Radius: 0.2
+      Position Tolerance: 0.01
+      Angle Tolerance: 0.01
+    - Class: rviz/Odometry
+      Name: Filtered Pole Correction
+      Enabled: true
+      Topic: /bievr_lio/poles/correction_filtered
+      Queue Size: 10
+      Keep: 1
+      Shape:
+        Value: Axes
+        Axes Length: 4
+        Axes Radius: 0.25
+      Position Tolerance: 0.01
+      Angle Tolerance: 0.01
     - Class: rviz/TF
       Name: TF
       Enabled: true

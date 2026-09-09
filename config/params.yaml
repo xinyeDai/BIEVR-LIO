@@ -29,16 +29,24 @@ map_save: # 此处保存纯里程计地图，不是回环优化地图；回环�
   path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/map.pcd" # 纯里程计地图的保存路径
 
 # 在线支柱提取：直接使用 LIO 的去畸变点云和同步位姿，在后台将若干扫描组成
-# 一个非重叠关键帧。先复用 scripts/coarse_extraction.py 的粗筛，再做圆柱拟合。
+# 带少量重叠的距离/帧数混合关键帧，再执行粗筛和圆柱拟合。
 pole_extraction:
   enable: True
 
-  # 关键帧与后台队列。当前 Livox 数据约 10 Hz，50 帧约为 5 秒点云。
-  frames_per_keyframe: 50
+  # 距离/帧数混合关键帧：行驶 30m 后触发，低速时最多累计 50 帧。
+  frames_per_keyframe: 50 # 最大帧数
+  min_frames_per_keyframe: 20 # 距离触发前至少积累的帧数
+  keyframe_distance_m: 30.0
+  keyframe_overlap_frames: 5 # 复用少量边界帧，减少支柱被窗口切断
   process_partial_keyframe: True # 退出时也处理最后一个未满关键帧
   min_partial_frames: 10
   max_queue: 3 # 提取跟不上时丢弃最老的待处理关键帧，避免阻塞里程计
   input_voxel_resolution_m: 0.10
+
+  # gnss_optimize 输出的 TUM 轨迹可在首次建图回放时填入这里，使支柱地图
+  # 位于 ENU/map 坐标系。第二次支柱重定位运行必须留空。
+  mapping_trajectory_path: ""
+  mapping_trajectory_max_time_gap_s: 0.20
 
   # 相对轨迹的铁路走廊 ROI；左侧为正 Y。
   use_roi: True
@@ -84,6 +92,105 @@ pole_extraction:
   landmark_max_radius_difference_m: 0.30
   output_directory: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/poles"
   save_keyframe_clouds: True # 保存 keyframe_XXXXXX_poles.pcd，便于逐关键帧复核
+
+  # 二次运行时加载首次保存的支柱地图，优化 T_map_odom 的 x/y/yaw。
+  # 建图和稠密定位时保持 False；params_pole_localization.yaml 会覆盖开启。
+  localization_enable: False
+  localization_map_path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/poles/landmarks.txt"
+  localization_map_frame: "map"
+  localization_window_keyframes: 7
+  localization_match_distance_m: 4.0
+  # 回程可能位于邻近股道：在普通 ±10m ROI 外，保留预测先验柱轴附近的点。
+  # 仅定位时生效；柱体检测、最少匹配数和验收门限不变。
+  localization_guided_roi: True
+  localization_guided_roi_radius_m: 5.0
+  localization_guided_roi_max_range_m: 40.0
+  localization_radius_difference_m: 0.30
+  localization_axis_angle_deg: 5.0
+  localization_min_matches: 3 # 数学下限；同时要求 60% 匹配率和 10m 基线
+  localization_min_match_ratio: 0.60
+  localization_min_baseline_m: 10.0
+  localization_max_rms_m: 0.50
+  localization_huber_delta_m: 0.50
+  localization_max_translation_step_m: 5.0
+  localization_max_yaw_step_deg: 5.0
+  # 正常使用 /initialpose、GNSS 或已知起点提供初值。仅当两次 odom 确定
+  # 共原点时才启用下面的手工初值。
+  localization_use_initial_guess: False
+  localization_initial_translation: [0.0, 0.0, 0.0]
+  # 可选完整姿态 [qx,qy,qz,qw]；存在时优先于 yaw。坡道或中途启动时建议填写。
+  localization_initial_orientation_xyzw: []
+  localization_initial_yaw_deg: 0.0
+
+# 纯“LIO + 支柱地图”定位输出层；与稠密点云 localization 严格互斥。
+pole_localization:
+  enable: False
+  map_frame: "map"
+  output_directory: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/pole_localization"
+
+  # T_map_odom 的 SE(2) 滤波：过程噪声随 LIO 行驶距离增长；测量噪声还会根据
+  # 支柱匹配 RMS、匹配数量和空间基线自适应调整。
+  filter_enable: True
+  process_noise_xy_m_per_sqrt_m: 0.05
+  process_noise_yaw_deg_per_sqrt_m: 0.03
+  process_noise_z_m_per_sqrt_m: 0.05
+  process_noise_tilt_deg_per_sqrt_m: 0.03
+  measurement_xy_floor_m: 0.08
+  measurement_yaw_floor_deg: 0.05
+  # 这里描述跨关键帧重复提取精度，不是单段曲线内部的厘米级拟合残差。
+  measurement_z_floor_m: 0.08
+  measurement_tilt_floor_deg: 0.10
+  mahalanobis_gate: 36.0
+  max_innovation_translation_m: 5.0
+  max_innovation_yaw_deg: 2.0
+  max_innovation_z_m: 1.0
+  max_innovation_tilt_deg: 2.0
+
+  # 首次和丢失恢复都要求连续多个窗口确认；长距离没有新支柱时仅改变状态，
+  # 仍保留最后修正并由 LIO 连续推算，不向 LIO 前端反馈跳变。
+  initial_confirmations: 2
+  recovery_confirmations: 2
+  degraded_after_distance_m: 90.0
+  lost_after_distance_m: 240.0
+
+  publish_path: True
+  path_publish_frequency: 2.0
+  path_max_poses: 0
+  prelocalization_buffer_frames: 5000 # 离线快速回放时按确认时间戳回填轨迹
+
+# 与支柱共用同一批关键帧的左右钢轨矢量提取。建图时保存稀疏三维折线；
+# 支柱地图定位时加载该文件，只补充 z/roll/pitch，不加载稠密点云。
+rail_extraction:
+  enable: False
+  station_resolution_m: 0.40
+  lateral_resolution_m: 0.05
+  lateral_min_m: -3.0
+  lateral_max_m: 3.0
+  relative_z_min_m: -5.30
+  relative_z_max_m: -3.40
+  nominal_gauge_m: 1.435
+  min_gauge_m: 1.20
+  max_gauge_m: 1.80
+  # 输入已经按 0.1m 体素降采样，细横断面内 1 个体素即有效；后续仍由
+  # 轨距、双轨显著性、连续性和最短段长度共同验收。
+  min_cell_points: 1
+  min_prominence_m: 0.035
+  max_lateral_jump_m: 0.30
+  max_vertical_jump_m: 0.15
+  max_cross_level_m: 0.20
+  min_segment_samples: 12
+  map_path: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/poles/rail_vector_map.txt"
+  match_distance_m: 2.0
+  max_tangent_angle_deg: 12.0
+  min_matches: 10
+  min_baseline_m: 8.0
+  huber_delta_m: 0.08
+  max_rms_m: 0.12
+  max_z_step_m: 1.0
+  max_tilt_step_deg: 2.0
+  # 本数据中 LIO 横滚优于由稀疏轨顶差得到的横滚，默认只更新高度和俯仰。
+  update_roll: False
+  update_pitch: True
 
 loop_closure: # 位于里程计后端的 Scan Context + GTSAM 位姿图回环模块
   enable: False # 建图时设为 True；纯里程计或定位时设为 False

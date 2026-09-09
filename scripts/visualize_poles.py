@@ -93,6 +93,35 @@ def landmark_geometries(row):
     return cylinder, base, axis_line
 
 
+def rail_geometries(rows):
+    geometries = []
+    for segment in sorted({int(row["Segment"]) for row in rows}):
+        samples = sorted(
+            (row for row in rows if int(row["Segment"]) == segment),
+            key=lambda row: int(row["Index"]),
+        )
+        if len(samples) < 2:
+            continue
+        left = np.array([[float(row["LeftX"]), float(row["LeftY"]),
+                          float(row["LeftZ"])] for row in samples])
+        right = np.array([[float(row["RightX"]), float(row["RightY"]),
+                           float(row["RightZ"])] for row in samples])
+        points = np.vstack([left, right])
+        count = len(samples)
+        lines = []
+        colors = []
+        for index in range(count - 1):
+            lines.extend([[index, index + 1], [count + index, count + index + 1]])
+            colors.extend([[1.0, 0.15, 0.05], [0.05, 0.35, 1.0]])
+        line_set = o3d.geometry.LineSet(
+            points=o3d.utility.Vector3dVector(points),
+            lines=o3d.utility.Vector2iVector(lines),
+        )
+        line_set.colors = o3d.utility.Vector3dVector(colors)
+        geometries.append(line_set)
+    return geometries
+
+
 def combine_extracted_clouds(paths, voxel_size):
     cloud = o3d.geometry.PointCloud()
     for path in paths:
@@ -116,18 +145,24 @@ def export_colored_cloud(path, geometries):
             output += geometry.sample_points_uniformly(number_of_points=800)
         elif isinstance(geometry, o3d.geometry.LineSet):
             points = np.asarray(geometry.points)
-            if len(points) == 2:
-                samples = np.linspace(points[0], points[1], 100)
+            lines = np.asarray(geometry.lines)
+            colors = np.asarray(geometry.colors)
+            for index, (first, second) in enumerate(lines):
+                samples = np.linspace(points[first], points[second], 20)
                 line_cloud = o3d.geometry.PointCloud(
                     o3d.utility.Vector3dVector(samples)
                 )
-                line_cloud.paint_uniform_color([1.0, 0.82, 0.05])
+                color = colors[index] if index < len(colors) else [1.0, 0.82, 0.05]
+                line_cloud.paint_uniform_color(color)
                 output += line_cloud
+    if output.has_colors():
+        colors = np.asarray(output.colors)
+        output.colors = o3d.utility.Vector3dVector(np.clip(colors, 0.0, 1.0))
     if not o3d.io.write_point_cloud(str(path), output):
         raise RuntimeError(f"无法写出可视化点云：{path}")
 
 
-def save_overview(path, map_cloud, extracted, landmarks):
+def save_overview(path, map_cloud, extracted, landmarks, rails):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -155,10 +190,26 @@ def save_overview(path, map_cloud, extracted, landmarks):
         top.scatter(centers[:, 0], centers[:, 1], s=80, c="#ff2b16",
                     edgecolors="white", linewidths=1.2, zorder=5,
                     label="pole landmark")
+    for segment in sorted({int(row["Segment"]) for row in rails}):
+        samples = sorted(
+            (row for row in rails if int(row["Segment"]) == segment),
+            key=lambda row: int(row["Index"]),
+        )
+        left = np.array([[float(row["LeftX"]), float(row["LeftY"]),
+                          float(row["LeftZ"])] for row in samples])
+        right = np.array([[float(row["RightX"]), float(row["RightY"]),
+                           float(row["RightZ"])] for row in samples])
+        top.plot(left[:, 0], left[:, 1], color="#ff2918", linewidth=1.0)
+        top.plot(right[:, 0], right[:, 1], color="#1769ff", linewidth=1.0)
+        side.plot(left[:, 0], left[:, 2], color="#ff2918", linewidth=0.8)
+        side.plot(right[:, 0], right[:, 2], color="#1769ff", linewidth=0.8)
     for index, (row, center) in enumerate(zip(landmarks, centers)):
         pole_id = int(row.get("ID", index))
-        top.annotate(f"Pole {pole_id}", center[:2], xytext=(5, 6),
-                     textcoords="offset points", color="#b00000", weight="bold")
+        # Stagger compact IDs so dense groups remain legible in a long corridor.
+        label_level = index % 4
+        top.annotate(f"P{pole_id}", center[:2], xytext=(3, 4 + 9 * label_level),
+                     textcoords="offset points", color="#b00000", weight="bold",
+                     fontsize=8)
         axis = np.array([float(row.get("AxisX", 0.0)),
                          float(row.get("AxisY", 0.0)),
                          float(row.get("AxisZ", 1.0))])
@@ -167,9 +218,9 @@ def save_overview(path, map_cloud, extracted, landmarks):
         upper = center + float(row.get("AxialMax", 10.0)) * axis
         side.plot([lower[0], upper[0]], [lower[2], upper[2]], color="#00d8ff",
                   linewidth=3)
-        side.text(upper[0], upper[2] + 0.4, f"P{pole_id}", ha="center",
-                  color="#b00000", weight="bold")
-    top.set_title("Railway pole extraction — top view")
+        side.text(upper[0], upper[2] + 0.4 + 1.2 * label_level, f"P{pole_id}",
+                  ha="center", color="#b00000", weight="bold", fontsize=8)
+    top.set_title("Railway pole + rail-vector map — top view")
     top.set_xlabel("X [m]")
     top.set_ylabel("Y [m]")
     top.axis("equal")
@@ -200,6 +251,8 @@ def main():
     args = parser.parse_args()
 
     landmarks = read_table(args.poles / "landmarks.txt")
+    rail_path = args.poles / "rail_vector_map.txt"
+    rails = read_table(rail_path) if rail_path.is_file() else []
     keyframe_paths = sorted(args.poles.glob("keyframe_*_poles.pcd"))
     geometries = []
     map_cloud = None
@@ -210,7 +263,9 @@ def main():
     if extracted is not None:
         geometries.append(extracted)
 
-    print(f"支柱地标：{len(landmarks)}，含支柱点的关键帧：{len(keyframe_paths)}")
+    geometries.extend(rail_geometries(rails))
+    print(f"支柱地标：{len(landmarks)}，轨道控制点：{len(rails)}，"
+          f"含支柱点的关键帧：{len(keyframe_paths)}")
     print("ID       X        Y        Z      半径    RMS   观测")
     for index, row in enumerate(landmarks):
         pole_id = int(row.get("ID", index))
@@ -227,7 +282,7 @@ def main():
         export_colored_cloud(args.export, geometries)
         print(f"已导出：{args.export}")
     if args.overview:
-        save_overview(args.overview, map_cloud, extracted, landmarks)
+        save_overview(args.overview, map_cloud, extracted, landmarks, rails)
         print(f"已保存总览图：{args.overview}")
     if not args.no_gui:
         o3d.visualization.draw_geometries(

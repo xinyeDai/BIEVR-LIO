@@ -76,6 +76,10 @@ const char* Localizer::toString(Status status) {
 
 Localizer::Localizer(Config config) : config_(std::move(config)) {}
 
+std::unique_ptr<Localizer> Localizer::create(Config config) {
+  return std::unique_ptr<Localizer>(new Localizer(std::move(config)));
+}
+
 Localizer::~Localizer() {
   {
     std::lock_guard<std::mutex> lock(stop_mutex_);
@@ -83,6 +87,12 @@ Localizer::~Localizer() {
   }
   stop_cv_.notify_all();
   if (worker_.joinable()) worker_.join();
+
+  // ScanContext is built as a separate DSO. Its Eigen buffers must be released
+  // by that DSO before PriorMap's inline destructor runs here; otherwise Eigen
+  // alignment differences between targets can turn a valid descriptor pointer
+  // into an invalid free at shutdown.
+  if (map_.reloc) map_.reloc->scan_context.clear();
 }
 
 bool Localizer::waitOrStop(std::chrono::duration<double> period) {

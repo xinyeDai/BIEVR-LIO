@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -30,7 +31,7 @@ class Localization {
   Localization(ros::NodeHandle& nh, const std::shared_ptr<Pipeline>& pipeline,
                LocalizationConfig config, const std::string& topic_prefix)
       : nh_(nh), config_(std::move(config)), pipeline_(pipeline),
-        localizer_(new Localizer(config_.localizer)) {
+        localizer_(Localizer::create(config_.localizer)) {
     odom_frame_ = pipeline->config().map_frame;
     body_frame_ = pipeline->config().body_frame;
     odom_pub_ = nh_.advertise<nav_msgs::Odometry>(topic_prefix + "/loc/odom", 1, true);

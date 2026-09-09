@@ -72,7 +72,10 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
 )
 
-add_library(bievr_pole_extractor src/pole_extractor.cpp)
+add_library(bievr_pole_extractor
+  src/pole_extractor.cpp
+  src/pole_localization.cpp
+)
 add_dependencies(bievr_pole_extractor ${catkin_EXPORTED_TARGETS})
 target_link_libraries(bievr_pole_extractor
   ${catkin_LIBRARIES}
@@ -83,6 +86,18 @@ target_link_libraries(bievr_pole_extractor
 
 add_executable(process_topics src/process_topics.cpp)
 add_executable(process_bag src/process_bag.cpp)
+add_executable(gnss_optimize src/gnss_optimize.cpp)
+
+add_dependencies(gnss_optimize ${catkin_EXPORTED_TARGETS})
+target_link_libraries(gnss_optimize
+  ${catkin_LIBRARIES}
+  bievr_lio::bievr_lio
+  bievr_pgo::bievr_pgo
+)
+if(UNIX AND NOT APPLE)
+  target_link_options(gnss_optimize PRIVATE "-Wl,--disable-new-dtags")
+  set_target_properties(gnss_optimize PROPERTIES INSTALL_RPATH "$ORIGIN/..")
+endif()
 
 foreach(target process_topics process_bag)
   # Ensure message headers from catkin dependencies exist first.
@@ -97,6 +112,15 @@ foreach(target process_topics process_bag)
     ${YAML_CPP_LIBRARIES}
     TBB::tbb
   )
+  if(UNIX AND NOT APPLE)
+    # The isolated workspace contains several plain-CMake libraries. Catkin's
+    # top-level setup only exports the ROS package's lib directory, while these
+    # are transitive dependencies of pgo/localization. Use old-style DT_RPATH
+    # (transitive) for the build tree, and find the co-installed libraries one
+    # directory above the node after installation.
+    target_link_options(${target} PRIVATE "-Wl,--disable-new-dtags")
+    set_target_properties(${target} PROPERTIES INSTALL_RPATH "$ORIGIN/..")
+  endif()
   # Optional Livox drivers: define the guard macros and pull in headers/libs
   # only when found (livox_ros_driver = gen1, livox_ros_driver2 = gen2).
   if(livox_ros_driver_FOUND)
@@ -111,7 +135,7 @@ foreach(target process_topics process_bag)
   endif()
 endforeach()
 
-install(TARGETS bievr_pole_extractor process_bag process_topics
+install(TARGETS bievr_pole_extractor process_bag process_topics gnss_optimize
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
