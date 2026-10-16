@@ -1,0 +1,7 @@
+<launch>
+  <arg name="params" default="$(find bievr_lio_ros)/../../config/params.yaml" />
+  <node pkg="bievr_lio_ros" type="gnss_recorder" name="bievr_gnss_recorder" output="screen">
+    <rosparam command="load" file="$(arg params)" />
+    <param name="output_directory" value="$(find bievr_lio_ros)/../../Log/gnss" />
+  </node>
+</launch>

@@ -14,6 +14,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   sensor_msgs
+  geometry_msgs
   visualization_msgs
   std_msgs
   nav_msgs
@@ -23,6 +24,16 @@ find_package(catkin REQUIRED COMPONENTS
   pcl_conversions
   std_srvs
 )
+# GeographicLib distributions do not all ship a CMake package configuration.
+find_path(GEOGRAPHICLIB_INCLUDE_DIR GeographicLib/LocalCartesian.hpp)
+find_library(GEOGRAPHICLIB_LIBRARY NAMES GeographicLib)
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(GeographicLib REQUIRED_VARS
+  GEOGRAPHICLIB_INCLUDE_DIR GEOGRAPHICLIB_LIBRARY
+)
+if(NOT GeographicLib_FOUND)
+  message(FATAL_ERROR "GeographicLib development files are required (libgeographiclib-dev).")
+endif()
 find_package(TBB REQUIRED)
 find_package(yaml-cpp REQUIRED)  # shared config_loader.h parses plain YAML files
 # bievr_lio (core) and bievr_ros_common (shared header-only glue) are plain-CMake
@@ -57,6 +68,7 @@ catkin_package(
   CATKIN_DEPENDS
     roscpp
     sensor_msgs
+    geometry_msgs
     visualization_msgs
     std_msgs
     nav_msgs
@@ -81,12 +93,18 @@ target_link_libraries(bievr_pole_extractor
   ${catkin_LIBRARIES}
   bievr_lio::bievr_lio
   bievr_ros_common::bievr_ros_common
+  bievr_pgo::bievr_pgo
   ${YAML_CPP_LIBRARIES}
 )
 
 add_executable(process_topics src/process_topics.cpp)
 add_executable(process_bag src/process_bag.cpp)
 add_executable(gnss_optimize src/gnss_optimize.cpp)
+add_executable(gnss_recorder src/gnss_recorder.cpp)
+target_include_directories(gnss_recorder PRIVATE ${GEOGRAPHICLIB_INCLUDE_DIR})
+target_link_libraries(gnss_recorder ${GEOGRAPHICLIB_LIBRARY})
+add_dependencies(gnss_recorder ${catkin_EXPORTED_TARGETS})
+target_link_libraries(gnss_recorder ${catkin_LIBRARIES})
 # In an isolated workspace a stale merged devel/include can precede the freshly
 # exported plain-CMake package. Prefer this repository's matching public header
 # for the GNSS executable; the linked implementation still comes from the
@@ -97,16 +115,13 @@ target_include_directories(gnss_optimize BEFORE PRIVATE
 
 add_dependencies(gnss_optimize ${catkin_EXPORTED_TARGETS})
 target_link_libraries(gnss_optimize
+  bievr_pole_extractor
+  ${YAML_CPP_LIBRARIES}
   ${catkin_LIBRARIES}
   bievr_lio::bievr_lio
   bievr_ros_common::bievr_ros_common
   bievr_pgo::bievr_pgo
 )
-if(livox_ros_driver_FOUND)
-  target_compile_definitions(gnss_optimize PRIVATE BIEVR_WITH_LIVOX)
-  target_include_directories(gnss_optimize PRIVATE ${livox_ros_driver_INCLUDE_DIRS})
-  target_link_libraries(gnss_optimize ${livox_ros_driver_LIBRARIES})
-endif()
 if(UNIX AND NOT APPLE)
   target_link_options(gnss_optimize PRIVATE "-Wl,--disable-new-dtags")
   set_target_properties(gnss_optimize PROPERTIES INSTALL_RPATH "$ORIGIN/..")
@@ -148,7 +163,7 @@ foreach(target process_topics process_bag)
   endif()
 endforeach()
 
-install(TARGETS bievr_pole_extractor process_bag process_topics gnss_optimize
+install(TARGETS bievr_pole_extractor process_bag process_topics gnss_optimize gnss_recorder
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
@@ -158,4 +173,25 @@ install(DIRECTORY include/${PROJECT_NAME}/
 )
 install(DIRECTORY launch rviz
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
+)
+install(PROGRAMS
+  ../../scripts/plot_gnss_trajectory_osm.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(scan_archive_test tests/scan_archive_test.cpp)
+  target_link_libraries(scan_archive_test bievr_lio::bievr_lio)
+  add_test(NAME scan_archive_roundtrip COMMAND scan_archive_test)
+  add_test(NAME gnss_poles_rebuild
+    COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/gnss_poles_rebuild_test.py $<TARGET_FILE:gnss_optimize>
+  )
+  add_test(NAME gnss_evaluation_report
+    COMMAND ${PYTHON_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/gnss_evaluation_test.py
+  )
+endif()
+
+catkin_install_python(PROGRAMS
+  ../../scripts/plot_gnss_optimization.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

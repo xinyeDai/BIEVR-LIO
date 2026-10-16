@@ -253,19 +253,21 @@ def main():
     landmarks = read_table(args.poles / "landmarks.txt")
     rail_path = args.poles / "rail_vector_map.txt"
     rails = read_table(rail_path) if rail_path.is_file() else []
-    keyframe_paths = sorted(args.poles.glob("keyframe_*_poles.pcd"))
+    merged_path = args.poles / "poles.pcd"
+    extracted_paths = ([merged_path] if merged_path.is_file() else
+                       sorted(args.poles.glob("keyframe_*_poles.pcd")))
     geometries = []
     map_cloud = None
     if not args.no_map:
         map_cloud = load_cloud(args.map, [0.48, 0.48, 0.48], args.map_voxel)
         geometries.append(map_cloud)
-    extracted = combine_extracted_clouds(keyframe_paths, args.pole_voxel)
+    extracted = combine_extracted_clouds(extracted_paths, args.pole_voxel)
     if extracted is not None:
         geometries.append(extracted)
 
     geometries.extend(rail_geometries(rails))
     print(f"支柱地标：{len(landmarks)}，轨道控制点：{len(rails)}，"
-          f"含支柱点的关键帧：{len(keyframe_paths)}")
+          f"支柱点云文件：{len(extracted_paths)}")
     print("ID       X        Y        Z      半径    RMS   观测")
     for index, row in enumerate(landmarks):
         pole_id = int(row.get("ID", index))

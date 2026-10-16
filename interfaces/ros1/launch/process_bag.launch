@@ -1,7 +1,7 @@
 <launch>
-  <!-- 启动前在这里修改传感器配置和 rosbag 的绝对路径。 -->
-  <arg name="sensor_config" default="ncd"/>
-  <arg name="params" default="params"/>
+  <!-- 离线模式 -->
+  <arg name="sensor_config" default="$(find bievr_lio_ros)/../../config/sensor_configs/ncd.yaml"/>
+  <arg name="params" default="$(find bievr_lio_ros)/../../config/params.yaml"/>
   <!-- Optional second YAML layer, e.g. params_localization for a repeat run. -->
   <arg name="params_overlay" default=""/>
   <arg name="rviz" default="false"/>

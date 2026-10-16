@@ -31,6 +31,7 @@ find_package(small_gicp REQUIRED)
 add_library(${PROJECT_NAME}
   src/loop_closer.cpp
   src/gnss_optimizer.cpp
+  src/sparse_localization_graph.cpp
 )
 add_library(${PROJECT_NAME}::${PROJECT_NAME} ALIAS ${PROJECT_NAME})
 
@@ -59,6 +60,29 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   bievr_map_io::bievr_map_io
   small_gicp::small_gicp
 )
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(gnss_alignment_test tests/gnss_alignment_test.cpp)
+  target_link_libraries(gnss_alignment_test PRIVATE ${PROJECT_NAME})
+  set_target_properties(gnss_alignment_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+  )
+  add_test(NAME gnss_alignment_test COMMAND gnss_alignment_test)
+  add_executable(sparse_localization_graph_test
+    tests/sparse_localization_graph_test.cpp
+  )
+  target_link_libraries(sparse_localization_graph_test PRIVATE ${PROJECT_NAME})
+  set_target_properties(sparse_localization_graph_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+  )
+  add_test(NAME sparse_localization_graph_test
+           COMMAND sparse_localization_graph_test)
+endif()
 
 # ---------------------------------------------------------------------------
 # Install & export

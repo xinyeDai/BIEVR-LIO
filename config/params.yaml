@@ -1,3 +1,9 @@
+# 在线 GNSS 及逐帧去畸变点云记录：用于不依赖 bag 的轨迹优化和地图重建。
+# 点云保存为 map_save.path 同目录下的 gnss/scans.bin；其余记录参数使用默认值。
+gnss_recorder:
+  enable: True
+  gnss_topic: "/gnss"
+
 map:
   pixel_size_m: 0.05 # 像素边长 [m]
   voxel_size_m: 0.5 # 体素边长 [m]
@@ -91,7 +97,7 @@ pole_extraction:
   landmark_max_axis_angle_deg: 5.0
   landmark_max_radius_difference_m: 0.30
   output_directory: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/poles"
-  save_keyframe_clouds: True # 保存 keyframe_XXXXXX_poles.pcd，便于逐关键帧复核
+  save_keyframe_clouds: True # 结束时将所有关键帧提取的支柱点汇总保存到 poles.pcd
 
   # 二次运行时加载首次保存的支柱地图，优化 T_map_odom 的 x/y/yaw。
   # 建图和稠密定位时保持 False；params_pole_localization.yaml 会覆盖开启。
@@ -128,9 +134,15 @@ pole_localization:
   map_frame: "map"
   output_directory: "/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/pole_localization"
 
-  # T_map_odom 的 SE(2) 滤波：过程噪声随 LIO 行驶距离增长；测量噪声还会根据
-  # 支柱匹配 RMS、匹配数量和空间基线自适应调整。
+  # 递推协方差层负责创新门控；通过门控的观测进入下方 GTSAM 因子图。
+  # 测量噪声根据匹配 RMS、匹配数量和空间基线自适应调整。
   filter_enable: True
+  # GTSAM Pose3 因子图：每个支柱/轨道提取关键帧建立 X(k)，相邻节点由 LIO
+  # BetweenFactor 连接；支柱只约束 x/y/yaw，轨道只约束 z/roll/pitch。
+  factor_graph_enable: True
+  factor_graph_huber_delta: 2.5
+  factor_graph_prior_translation_sigma_m: 0.50
+  factor_graph_prior_rotation_sigma_deg: 2.0
   process_noise_xy_m_per_sqrt_m: 0.05
   process_noise_yaw_deg_per_sqrt_m: 0.03
   process_noise_z_m_per_sqrt_m: 0.05
@@ -142,9 +154,18 @@ pole_localization:
   measurement_tilt_floor_deg: 0.10
   mahalanobis_gate: 36.0
   max_innovation_translation_m: 5.0
-  max_innovation_yaw_deg: 2.0
-  max_innovation_z_m: 1.0
+  # Railway poles are periodic: the bag1--bag3 online replay produced a
+  # geometrically tight three-pole alias with a 1.229 deg yaw jump, while the
+  # preceding valid filtered updates stayed below 0.201 deg.
+  max_innovation_yaw_deg: 0.5
+  # 该数据中非刚性的 map<-odom 高程修正相邻关键帧可变化约 2~5m；候选进入
+  # 此处前已经通过轨距、切向、基线和竖直 RMS 检验，因此使用独立的宽门限。
+  max_innovation_z_m: 5.0
   max_innovation_tilt_deg: 2.0
+  rail_mahalanobis_gate: 144.0
+  # 超过该里程没有通过轨道约束时，下一次高质量轨道拟合重新初始化
+  # z/roll/pitch，避免长无轨区后的累计高程差被小创新门限永久拒绝。
+  rail_rebootstrap_gap_m: 100.0
 
   # 首次和丢失恢复都要求连续多个窗口确认；长距离没有新支柱时仅改变状态，
   # 仍保留最后修正并由 LIO 连续推算，不向 LIO 前端反馈跳变。
@@ -161,7 +182,11 @@ pole_localization:
 # 与支柱共用同一批关键帧的左右钢轨矢量提取。建图时保存稀疏三维折线；
 # 支柱地图定位时加载该文件，只补充 z/roll/pitch，不加载稠密点云。
 rail_extraction:
-  enable: False
+  enable: True
+  # rails.pcd 保留原始分辨率的实测钢轨点；相对轨顶的筛选范围。
+  cloud_half_width_m: 0.10
+  cloud_depth_m: 0.18
+  cloud_above_m: 0.05
   station_resolution_m: 0.40
   lateral_resolution_m: 0.05
   lateral_min_m: -3.0
@@ -186,10 +211,14 @@ rail_extraction:
   min_baseline_m: 8.0
   huber_delta_m: 0.08
   max_rms_m: 0.12
+  # 轨道平面约束只使用横轨方向和 yaw；沿轨平移始终不进入残差。
+  max_planar_rms_m: 0.30
+  max_cross_track_step_m: 1.0
+  max_yaw_step_deg: 2.0
   max_z_step_m: 1.0
   max_tilt_step_deg: 2.0
-  # 本数据中 LIO 横滚优于由稀疏轨顶差得到的横滚，默认只更新高度和俯仰。
-  update_roll: False
+  # 左右轨顶高差约束横滚，沿线坡度约束俯仰；均不引入沿轨方向平移约束。
+  update_roll: True
   update_pitch: True
 
 loop_closure: # 位于里程计后端的 Scan Context + GTSAM 位姿图回环模块
@@ -245,7 +274,7 @@ debug:
   publish_all_clouds: False # 是否发布所有点云（精细、粗略、去畸变）
   timing: False
   log: False
-  dashboard: True # 是否实时显示位置、零偏、耗时等状态
+  dashboard: False # 是否实时显示位置、零偏、耗时等状态
   dashboard_ascii_path: "" # 留空时使用配置文件旁的 bievr_ascii.txt
   trajectory_path: "" # 最终 TUM 轨迹自动保存为 Log/odometry_tum.txt；此项留空避免重复写入
 

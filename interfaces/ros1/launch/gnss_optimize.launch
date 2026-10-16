@@ -1,39 +1,24 @@
 <launch>
-  <!-- Run LIO first, then feed its odometry_tum.txt and the same bag here. -->
-  <arg name="bag" />
+  <!-- GNSS 因子图优化；算法参数统一在 config/gnss_optimize.yaml 中配置。 -->
+  <arg name="scans" default="" />
+  <arg name="poles_directory" default="" />
+  <arg name="pole_params_file" default="" />
+  <arg name="skip_poles" default="false" />
+  <arg name="skip_output_map" default="false" />
+  <arg name="gnss_enu" default="" />
   <arg name="lio_trajectory" />
-  <arg name="output_directory" default="$(find bievr_lio_ros)/../../../Log/gnss_optimization" />
-  <arg name="gnss_topic" default="/gnss" />
-  <arg name="pointcloud_topic" default="/livox/lidar" />
-  <arg name="output_map" default="$(arg output_directory)/gnss_optimized_map.pcd" />
+  <arg name="output_directory" default="$(find bievr_lio_ros)/../../Log/gnss_optimization" />
 
   <node pkg="bievr_lio_ros" type="gnss_optimize" name="bievr_gnss_optimize"
         output="screen">
-    <param name="bag" value="$(arg bag)" />
+    <rosparam command="load" file="$(find bievr_lio_ros)/../../config/gnss_optimize.yaml" />
+    <param name="scans" value="$(arg scans)" />
+    <param name="poles_directory" value="$(arg poles_directory)" />
+    <param name="pole_params_file" value="$(arg pole_params_file)" />
+    <param name="skip_poles" value="$(arg skip_poles)" />
+    <param name="skip_output_map" value="$(arg skip_output_map)" />
+    <param name="gnss_enu" value="$(arg gnss_enu)" />
     <param name="lio_trajectory" value="$(arg lio_trajectory)" />
     <param name="output_directory" value="$(arg output_directory)" />
-    <param name="gnss_topic" value="$(arg gnss_topic)" />
-    <param name="pointcloud_topic" value="$(arg pointcloud_topic)" />
-    <param name="output_map" value="$(arg output_map)" />
-    <param name="map_voxel_resolution_m" value="0.15" />
-    <param name="map_min_range_m" value="1.0" />
-    <param name="map_max_range_m" value="100.0" />
-    <param name="max_time_gap_s" value="0.20" />
-    <param name="horizontal_sigma_floor_m" value="0.05" />
-    <param name="vertical_sigma_floor_m" value="0.10" />
-    <!-- lever arm is GNSS antenna position expressed in the LIO/body frame -->
-    <rosparam param="gnss_lever_arm_body_m">[0.0, 0.0, 0.0]</rosparam>
-    <param name="gnss_covariance_scale" value="1.0" />
-    <rosparam param="gnss_sigma_override_m">[-1.0, -1.0, -1.0]</rosparam>
-    <param name="gnss_robust_kernel" value="Huber" />
-    <param name="gnss_robust_delta" value="2.5" />
-    <param name="initial_outlier_gate_m" value="3.0" />
-    <param name="postfit_outlier_chi2" value="50.0" />
-    <param name="odom_rotation_sigma_deg_per_sqrt_m" value="0.02" />
-    <param name="odom_translation_sigma_m_per_sqrt_m" value="0.02" />
-    <param name="minimum_edge_distance_m" value="0.10" />
-    <param name="odom_neighbor_span" value="3" />
-    <param name="control_pose_interval_s" value="0.50" />
-    <param name="max_iterations" value="100" />
   </node>
 </launch>

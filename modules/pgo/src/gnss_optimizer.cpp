@@ -109,6 +109,15 @@ bool associate(const std::vector<GnssTrajectoryOptimizer::StampedPose>& poses,
   return true;
 }
 
+double median(std::vector<double> values) {
+  const size_t middle = values.size() / 2;
+  std::nth_element(values.begin(), values.begin() + middle, values.end());
+  const double upper = values[middle];
+  if (values.size() % 2 != 0) return upper;
+  std::nth_element(values.begin(), values.begin() + middle - 1, values.end());
+  return 0.5 * (values[middle - 1] + upper);
+}
+
 Transform planarAlignment(const std::vector<GnssTrajectoryOptimizer::StampedPose>& lio,
                           const std::vector<Association>& associations,
                           const V3& lever_arm) {
@@ -131,7 +140,15 @@ Transform planarAlignment(const std::vector<GnssTrajectoryOptimizer::StampedPose
   }
   const double yaw = std::atan2(cross, dot);
   const Rotation rotation = Eigen::AngleAxisd(yaw, V3::UnitZ()).toRotationMatrix();
-  return Transform(rotation, target_mean - rotation * source_mean);
+  V3 translation = target_mean - rotation * source_mean;
+  std::vector<double> height_offsets;
+  height_offsets.reserve(associations.size());
+  for (const Association& association : associations) {
+    height_offsets.push_back(association.measurement->position.z() -
+                             interpolatePosition(lio, association, lever_arm).z());
+  }
+  translation.z() = median(std::move(height_offsets));
+  return Transform(rotation, translation);
 }
 
 struct ResidualStats {
@@ -291,7 +308,12 @@ bool GnssTrajectoryOptimizer::optimize(
   if (config_.max_time_gap_s <= 0.0 || config_.horizontal_sigma_floor_m <= 0.0 ||
       config_.vertical_sigma_floor_m <= 0.0 || config_.gnss_covariance_scale <= 0.0 ||
       config_.gnss_robust_delta <= 0.0 ||
-      config_.initial_outlier_gate_m <= 0.0 ||
+      !std::isfinite(config_.initial_alignment_duration_s) ||
+      config_.initial_alignment_duration_s <= 0.0 ||
+      !std::isfinite(config_.initial_alignment_min_baseline_m) ||
+      config_.initial_alignment_min_baseline_m <= 0.0 ||
+      !std::isfinite(config_.initial_outlier_gate_m) ||
+      config_.initial_outlier_gate_m < 0.0 ||
       config_.odom_rotation_sigma_deg_per_sqrt_m <= 0.0 ||
       config_.odom_translation_sigma_m_per_sqrt_m <= 0.0 ||
       config_.minimum_edge_distance_m <= 0.0 || config_.odom_neighbor_span <= 0 ||
@@ -330,8 +352,52 @@ bool GnssTrajectoryOptimizer::optimize(
     return false;
   }
 
-  stats.initial_T_enu_odom =
-      planarAlignment(control_lio, candidates, config_.gnss_lever_arm_body_m);
+  // GNSS input need not be sorted. Use only the beginning of the overlap so
+  // accumulated drift later in the run cannot bias the coordinate-frame seed.
+  std::sort(candidates.begin(), candidates.end(),
+            [](const Association& a, const Association& b) {
+              return a.measurement->stamp < b.measurement->stamp;
+            });
+  const uint64_t alignment_start = candidates.front().measurement->stamp;
+  std::vector<Association> alignment_associations;
+  for (const Association& association : candidates) {
+    const double elapsed_s =
+        static_cast<double>(association.measurement->stamp - alignment_start) * 1e-9;
+    if (elapsed_s > config_.initial_alignment_duration_s) break;
+    alignment_associations.push_back(association);
+  }
+  if (alignment_associations.size() < 3) {
+    if (message) *message =
+        "Fewer than three GNSS fixes in the initial alignment window; "
+        "increase initial_alignment_duration_s.";
+    return false;
+  }
+  const V3 source_start = interpolatePosition(
+      control_lio, alignment_associations.front(), config_.gnss_lever_arm_body_m);
+  const V3 target_start = alignment_associations.front().measurement->position;
+  double source_baseline = 0.0;
+  double target_baseline = 0.0;
+  for (const Association& association : alignment_associations) {
+    source_baseline = std::max(source_baseline,
+        (interpolatePosition(control_lio, association, config_.gnss_lever_arm_body_m) -
+         source_start).head<2>().norm());
+    target_baseline = std::max(target_baseline,
+        (association.measurement->position - target_start).head<2>().norm());
+  }
+  if (std::min(source_baseline, target_baseline) <
+      config_.initial_alignment_min_baseline_m) {
+    if (message) *message =
+        "Insufficient horizontal motion in the initial alignment window; "
+        "increase initial_alignment_duration_s or check the GNSS/LIO data.";
+    return false;
+  }
+  stats.initial_alignment_measurements = alignment_associations.size();
+  stats.initial_alignment_start_offset_s =
+      static_cast<double>(alignment_start - lio.front().stamp) * 1e-9;
+  stats.initial_alignment_span_s = static_cast<double>(
+      alignment_associations.back().measurement->stamp - alignment_start) * 1e-9;
+  stats.initial_T_enu_odom = planarAlignment(
+      control_lio, alignment_associations, config_.gnss_lever_arm_body_m);
   std::vector<StampedPose> initialized = control_lio;
   for (StampedPose& pose : initialized) {
     pose.pose = Transform(stats.initial_T_enu_odom * pose.pose);
@@ -339,11 +405,38 @@ bool GnssTrajectoryOptimizer::optimize(
 
   std::vector<Association> associations;
   associations.reserve(candidates.size());
+  std::vector<double> initial_horizontal_residuals;
+  initial_horizontal_residuals.reserve(candidates.size());
   for (const Association& association : candidates) {
     const V3 residual = interpolatePosition(
                             initialized, association, config_.gnss_lever_arm_body_m) -
                         association.measurement->position;
-    if (residual.head<2>().norm() <= config_.initial_outlier_gate_m) {
+    initial_horizontal_residuals.push_back(residual.head<2>().norm());
+  }
+  // Only the seed window can be judged against a rigid initial alignment.
+  // Later residuals include accumulated LIO drift, so even an adaptive global
+  // gate can permanently discard valid tail fixes. Admit those fixes to the
+  // robust solve and judge them using the post-fit residual instead.
+  const size_t seed_count = alignment_associations.size();
+  const std::vector<double> seed_residuals(
+      initial_horizontal_residuals.begin(),
+      initial_horizontal_residuals.begin() + seed_count);
+  const double residual_median = median(seed_residuals);
+  std::vector<double> absolute_deviations;
+  absolute_deviations.reserve(seed_residuals.size());
+  for (const double residual : seed_residuals) {
+    absolute_deviations.push_back(std::abs(residual - residual_median));
+  }
+  const double robust_sigma = 1.4826 * median(absolute_deviations);
+  stats.effective_initial_outlier_gate_m = config_.initial_outlier_gate_m == 0.0
+      ? 0.0
+      : std::max(config_.initial_outlier_gate_m,
+                 residual_median + 6.0 * std::max(robust_sigma, 0.10));
+  for (size_t index = 0; index < candidates.size(); ++index) {
+    const Association& association = candidates[index];
+    if (index >= seed_count || config_.initial_outlier_gate_m == 0.0 ||
+        initial_horizontal_residuals[index] <=
+        stats.effective_initial_outlier_gate_m) {
       associations.push_back(association);
     } else {
       ++stats.rejected_outlier;
@@ -375,6 +468,20 @@ bool GnssTrajectoryOptimizer::optimize(
     graph.add(gtsam::PriorFactor<gtsam::Pose3>(
         0, toPose3(initialized.front().pose),
         gtsam::noiseModel::Diagonal::Sigmas(prior_sigmas)));
+    // GNSS positions must not bend the LIO gravity attitude over a long run.
+    // Preserve each initialized pose's roll/pitch while leaving yaw and all
+    // translations effectively unconstrained by these auxiliary priors.
+    gtsam::Vector6 gravity_attitude_sigmas;
+    gravity_attitude_sigmas
+        << config_.prior_roll_pitch_sigma_deg * degrees_to_radians,
+        config_.prior_roll_pitch_sigma_deg * degrees_to_radians,
+        1000.0 * degrees_to_radians, 1.0e6, 1.0e6, 1.0e6;
+    const auto gravity_attitude_noise =
+        gtsam::noiseModel::Diagonal::Sigmas(gravity_attitude_sigmas);
+    for (size_t index = 1; index < initialized.size(); ++index) {
+      graph.add(gtsam::PriorFactor<gtsam::Pose3>(
+          index, toPose3(initialized[index].pose), gravity_attitude_noise));
+    }
     for (size_t first = 0; first < control_lio.size(); ++first) {
       for (int step = 1; step <= config_.odom_neighbor_span; ++step) {
         const size_t second = first + static_cast<size_t>(step);

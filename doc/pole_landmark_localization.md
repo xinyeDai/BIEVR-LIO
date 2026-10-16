@@ -136,13 +136,22 @@ GNSS 时间通常位于两个激光帧之间，因此使用二元插值位置因
 
 ```bash
 rosrun bievr_lio_ros gnss_optimize \
-  --bag /absolute/path/to/data.bag \
+  --gnss_enu /absolute/path/to/gnss/gnss_enu.txt \
+  --scans /absolute/path/to/gnss/scans.bin \
   --lio_trajectory /absolute/path/to/odometry_tum.txt \
   --output_directory /absolute/path/to/gnss_result
 ```
 
 输出包括 `gnss_optimized_tum.txt`、`summary.yaml` 和
-`initial_correction.yaml`。随后首次支柱建图在 `pole_extraction` 中配置：
+`initial_correction.yaml`。如果轨迹同级已经存在 `poles/landmarks.txt`，优化程序
+会自动使用 `scans.bin` 和优化后的逐帧位姿重新提取，更新 `poles/` 中的地标、
+检测记录、支柱点云、轨道矢量与实测轨道点云；旧目录备份为 `poles.before_gnss_*`。
+提取参数优先读取 `poles/extraction_config.yaml`，旧结果无快照时回退到
+`config/params.yaml`。可用 `--poles_directory`、`--pole_params_file` 指定目录和参数，
+`--skip-poles` 跳过；`--skip-output-map` 仍会重建支柱/轨道。
+重建失败不替换原目录，重复运行从 body 点云重建，不叠加修正。
+
+只有尚无支柱地图、需要首次手动提取时，才在 `pole_extraction` 中配置：
 
 ```yaml
 localization_enable: false

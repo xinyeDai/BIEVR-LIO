@@ -37,6 +37,12 @@ class GnssTrajectoryOptimizer {
     V3 gnss_sigma_override_m = V3::Constant(-1.0);
     std::string gnss_robust_kernel = "Huber";  // Huber | Cauchy | None
     double gnss_robust_delta = 2.5;             // normalized residual units
+    // Seed from the beginning of the GNSS/LIO overlap, never the full run.
+    double initial_alignment_duration_s = 45.0;
+    double initial_alignment_min_baseline_m = 5.0;
+    // Apply the initial horizontal gate only inside the alignment window.
+    // Later fixes enter the robust solve despite accumulated LIO drift and
+    // are checked by postfit_outlier_chi2. Zero disables the initial gate.
     double initial_outlier_gate_m = 3.0;
     // Raw normalized squared residual threshold after the first solve. Set to
     // zero to disable the second-stage GNSS outlier rejection.
@@ -74,6 +80,10 @@ class GnssTrajectoryOptimizer {
     size_t rejected_time = 0;
     size_t rejected_outlier = 0;
     size_t rejected_postfit = 0;
+    size_t initial_alignment_measurements = 0;
+    double initial_alignment_start_offset_s = 0.0;
+    double initial_alignment_span_s = 0.0;
+    double effective_initial_outlier_gate_m = 0.0;
     double initial_horizontal_rmse_m = 0.0;
     double optimized_horizontal_rmse_m = 0.0;
     double initial_3d_rmse_m = 0.0;

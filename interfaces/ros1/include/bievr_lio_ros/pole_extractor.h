@@ -81,6 +81,8 @@ struct PoleExtractionConfig {
   double landmark_max_radius_difference = 0.30;
 
   std::string output_directory = "Log/poles";
+  std::string extraction_config_yaml; // Effective YAML snapshot for offline rebuilding.
+  // Legacy config name: save all extracted pole points together in poles.pcd.
   bool save_keyframe_clouds = true;
 
   // Match a rolling local pole map against landmarks saved by a mapping run.
@@ -113,8 +115,9 @@ struct PoleExtractionConfig {
 
   // Rail-vector extraction reuses exactly the same accumulated keyframes.
   // Each accepted cross section contributes a paired left/right rail-top
-  // control point. The saved polyline map is sparse; no dense cloud is needed
-  // in the localization run.
+  // control point. Localization connects adjacent control points into 3-D
+  // line segments and projects observations continuously onto those segments;
+  // the saved text format remains backward compatible.
   bool rail_enable = false;
   double rail_station_resolution = 0.40;
   double rail_lateral_resolution = 0.05;
@@ -131,6 +134,10 @@ struct PoleExtractionConfig {
   double rail_max_vertical_jump = 0.15;
   double rail_max_cross_level = 0.20;
   size_t rail_min_segment_samples = 12;
+  // Full-resolution measured points near the detected rail head.
+  double rail_cloud_half_width = 0.10;
+  double rail_cloud_depth = 0.18;
+  double rail_cloud_above = 0.05;
   std::string rail_map_path;
   double rail_match_distance = 2.0;
   double rail_max_tangent_angle_deg = 12.0;
@@ -138,9 +145,12 @@ struct PoleExtractionConfig {
   double rail_min_baseline = 8.0;
   double rail_huber_delta = 0.08;
   double rail_max_rms = 0.12;
+  double rail_max_planar_rms = 0.30;
+  double rail_max_cross_track_step = 1.0;
+  double rail_max_yaw_step_deg = 2.0;
   double rail_max_z_step = 1.0;
   double rail_max_tilt_step_deg = 2.0;
-  bool rail_update_roll = false;
+  bool rail_update_roll = true;
   bool rail_update_pitch = true;
 };
 
@@ -164,15 +174,27 @@ struct PoleLocalizationCorrection {
   // Cumulative planar LIO travel at stamp. This lets the localization filter
   // propagate covariance in sensor-time order instead of worker wall time.
   double odom_distance_m = 0.0;
+  // Odom-frame pivot at which a planar correction was observed. Comparing
+  // map<-odom translations directly is not invariant to yaw: far from the
+  // odom origin a small yaw change can alter tx/ty by several metres while
+  // moving the vehicle only centimetres.
+  V3 correction_anchor_odom = V3::Zero();
   size_t matches = 0;
   double match_ratio = 0.0;
   double baseline = 0.0;
   double rms = 0.0;
+  // For a rail observation, the planar RMS is the centerline point-to-line
+  // residual. rail_tangent_map defines the deliberately unobservable
+  // along-track translation direction.
+  double planar_rms = 0.0;
+  V3 rail_tangent_map = V3::UnitX();
   // Pole corrections constrain x/y/yaw. Rail corrections constrain
   // z/roll/pitch. Keeping the masks explicit prevents a straight rail from
   // injecting an unobservable along-track displacement.
   bool constrain_planar = true;
   bool constrain_vertical = false;
+  bool constrain_cross_track = false;
+  bool constrain_yaw = false;
   bool constrain_z = false;
   bool constrain_roll = false;
   bool constrain_pitch = false;
@@ -187,6 +209,9 @@ class PoleExtractor {
  public:
   PoleExtractor(ros::NodeHandle& nh, const std::shared_ptr<Pipeline>& pipeline,
                 PoleExtractionConfig config, const std::string& topic_prefix);
+  // Offline replay: no ROS publishers/master, bounded queue without dropped frames.
+  explicit PoleExtractor(PoleExtractionConfig config, const std::string& map_frame = "map");
+  void addFrame(uint64_t stamp, const Transform& pose, const Pointcloud& cloud);
   ~PoleExtractor();
 
   PoleExtractor(const PoleExtractor&) = delete;
@@ -205,8 +230,11 @@ class PoleExtractor {
   // configured/manual seed. Dense-map localization is deliberately separate.
   using CorrectionProvider = std::function<std::optional<Transform>()>;
   using CorrectionObserver = std::function<void(const PoleLocalizationCorrection&)>;
+  using KeyframeObserver =
+      std::function<void(uint64_t, const Transform&, double)>;
   void setCorrectionProvider(CorrectionProvider provider);
   void setCorrectionObserver(CorrectionObserver observer);
+  void setKeyframeObserver(KeyframeObserver observer);
   PoleLocalizationCorrection localizationCorrection() const;
   bool localizationReady() const;
 

@@ -14,6 +14,12 @@
 namespace bievr {
 
 Pipeline::Pipeline(const Config& config) : config_(config) {
+  if (config_.record_gnss_scans) {
+    const std::filesystem::path map_path(config_.map_save_path);
+    const auto log_dir = map_path.has_parent_path() ? map_path.parent_path() : std::filesystem::path("Log");
+    scan_archive_ = std::make_unique<ScanArchiveWriter>(log_dir / "gnss" / "scans.bin");
+    LOG(I, "Recording deskewed body-frame scans to " << (log_dir / "gnss" / "scans.bin"));
+  }
   map_ = std::make_shared<BIEVRMap>(config_.map);
 
   if (config_.accumulate_map) {
@@ -236,6 +242,7 @@ void Pipeline::tryInitMap(uint64_t stamp, const State& x_j_pred, const Transform
   map_->integratePoints(registered, &ranges);
   addState(stamp, x_j_pred.quat, x_j_pred.p, x_j_pred.v);
   publishLatestState(header);
+  if (scan_archive_) scan_archive_->add(header.stamp, IntensityPointcloud(undistorted, intensities));
   IntensityPointcloud registered_with_intensity(registered, intensities);
   publish(registered_with_intensity, header, "points/registered");
   accumulateMap(std::move(registered_with_intensity));
@@ -356,6 +363,7 @@ void Pipeline::publishFrame(const Header& header, const Transform& T_W_I,
     publishDebugClouds(source_filtered, source_coarse, source_fine, intensities, T_W_I,
                        header);
   }
+  if (scan_archive_) scan_archive_->add(header.stamp, IntensityPointcloud(undistorted, intensities));
   IntensityPointcloud registered_with_intensity(full_registered, intensities);
   publish(registered_with_intensity, header, "points/registered");
   accumulateMap(std::move(registered_with_intensity));
@@ -425,7 +433,8 @@ bool Pipeline::saveResults(const std::string& log_dir) {
     return false;
   }
 
-  bool success = true;
+  bool success = !scan_archive_ || scan_archive_->finish();
+  if (!success) LOG(E, "Failed writing GNSS scan archive.");
   if (map_accumulator_) {
     map_accumulator_->flush();
     success = saveMap((output_dir / "map.pcd").string()) && success;

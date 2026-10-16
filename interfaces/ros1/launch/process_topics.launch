@@ -1,14 +1,11 @@
 <launch>
-  <!-- 在这里直接修改传感器配置；可填写 config/sensor_configs 下的文件名（不含 .yaml），
-       也可以填写自定义配置文件的绝对路径。 -->
-  <arg name="sensor_config" default="ncd"/>
-  <arg name="params" default="params"/>
+  <!-- 在线模式 -->
+  <arg name="sensor_config" default="$(find bievr_lio_ros)/../../config/sensor_configs/ncd.yaml"/>
+  <arg name="params" default="$(find bievr_lio_ros)/../../config/params.yaml"/>
   <arg name="rviz" default="false"/>
-  <!-- The node reads the YAML config-file paths from its command-line arguments
-       (not the ROS parameter server), so they are passed via args=. An absolute
-       path (starting with '/') is used verbatim so configs can live in an
-       external folder; otherwise the arg is a name (without .yaml) looked up in
-       the package's config/ directory. -->
+  <include file="$(find bievr_lio_ros)/launch/gnss_recorder.launch">
+    <arg name="params" value="$(eval arg('params') if arg('params').startswith('/') else find('bievr_lio_ros') + '/../../config/' + arg('params') + '.yaml')"/>
+  </include>
   <node pkg="bievr_lio_ros" type="process_topics" name="bievr_lio_topics_node" output="screen"
         args="$(eval '--sensor_config_file ' + (arg('sensor_config') if arg('sensor_config').startswith('/') else find('bievr_lio_ros') + '/../../config/sensor_configs/' + arg('sensor_config') + '.yaml') + ' --params_file ' + (arg('params') if arg('params').startswith('/') else find('bievr_lio_ros') + '/../../config/' + arg('params') + '.yaml'))"/>
 

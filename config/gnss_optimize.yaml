@@ -1,0 +1,88 @@
+# 离线 GNSS + LIO 轨迹优化配置，由 gnss_optimize.launch 加载到节点私有参数。
+# 采用 GTSAM Levenberg-Marquardt 批优化；输入路径通过 launch 参数指定。
+# GNSS 输入位置使用 ENU 米制坐标，后三列为 E/N/U 方差（m²），不是标准差。
+
+# 地图输出：使用优化轨迹重新投影在线保存的 body 坐标系点云归档。
+# scans 路径为空时，默认在 GNSS 文本同目录寻找 scans.bin。
+# 以下地图参数只影响地图重建，不改变轨迹优化；skip_output_map:=true 可跳过地图。
+# 输出 PCD 路径；留空时写入 output_directory/gnss_optimized_map.pcd。
+output_map: ""
+# 地图体素边长（m，须 > 0）：每个体素保留一个点；增大可减少点数和文件大小。
+map_voxel_resolution_m: 0.15
+# 保留点相对 body 原点的距离范围（m）：最小距离 >= 0，最大距离须大于最小距离。
+map_min_range_m: 1.0
+map_max_range_m: 100.0
+
+# 已有支柱/轨道地图：优化后自动从 scans.bin 按优化轨迹重新提取，替换 poles/。
+# 默认目录为 lio_trajectory 同级 poles/；先保留 poles.before_gnss_* 原目录备份。
+# 优先使用 poles/extraction_config.yaml；旧结果无快照时使用 config/params.yaml。
+# 自定义目录/参数通过 poles_directory、pole_params_file launch 参数指定。
+# skip_poles:=true 可保留旧结果；skip_output_map 不会跳过支柱/轨道重建。
+
+# GNSS 时间关联与观测噪声
+# 时间关联容差（s，须 > 0）；GNSS 在相邻控制位姿的天线位置之间线性插值。
+# 优化关联实际使用 g = max(max_time_gap_s, control_pose_interval_s)：
+# 要求最近控制位姿的时间差 <= g，且两侧控制位姿间隔 <= 2g；不向轨迹范围外外推。
+# 输出 GNSS 对比报告的时间关联仍使用本参数，不采用上述增大的 g。
+max_time_gap_s: 0.2
+# 水平 E/N 标准差下限（m，须 > 0），防止接收机过小的方差使 GNSS 权重过高。
+# 下限越大，优化越少依赖该方向的 GNSS；正值 sigma_override 会覆盖该下限。
+horizontal_sigma_floor_m: 0.05
+# 竖直 U 标准差下限（m，须 > 0）；调大可减弱 GNSS 高程对 LIO 的牵引。
+vertical_sigma_floor_m: 0.10
+# GNSS 天线相对 LIO/body 原点的杆臂 [x, y, z]（m，在 body 坐标系下表达）。
+# 预测天线位置 = body 位置 + body 旋转 × 杆臂；零向量表示两者位置重合。
+gnss_lever_arm_body_m: [0.0, 0.0, 0.0]
+# 输入方差乘数（无量纲，须 > 0）：标准差随其平方根缩放，然后再应用标准差下限。
+# 增大可降低 GNSS 权重；例如 4.0 对应输入标准差放大 2 倍（未触及下限时）。
+gnss_covariance_scale: 1.0
+# 按 [E, N, U] 覆盖最终标准差（m）：分量 > 0 时直接使用该值，绕过方差缩放和下限。
+# 分量 <= 0 时使用输入文件方差经缩放、开方并应用下限后的结果；可逐轴独立设置。
+gnss_sigma_override_m: [0.01, 0.01, 0.03]
+
+# 初始 ENU 对齐：只使用有效 GNSS/LIO 重叠段开头的数据估计 yaw 和平移，
+# 高程平移取中位数；后期累计漂移不参与初始对齐，全程有效 GNSS 仍参与后续优化。
+# 对齐窗口时长（s，须 > 0），从第一个成功关联的 GNSS 时刻起算，窗口内至少需 3 点。
+# 若起步静止或移动距离不足，可增大窗口；过长可能引入更多 LIO 漂移。
+initial_alignment_duration_s: 45.0
+# 对齐所需最小水平基线（m，须 > 0）：LIO 和 GNSS 各自相对窗口首点的
+# 最大水平位移都须达到该值，否则对齐失败；用于避免静止时 yaw 不可观。
+initial_alignment_min_baseline_m: 5.0
+
+# GNSS 鲁棒降权与粗差剔除
+# 鲁棒核可选 Huber / Cauchy / None（大小写不敏感）；None 表示普通高斯噪声。
+# 鲁棒核对较大残差降权，不直接删除观测；硬剔除由下面两项门限控制。
+gnss_robust_kernel: "Huber"
+# 鲁棒核尺度（归一化残差单位，须 > 0，不是米）；Huber 超过此尺度开始降权。
+# 调小增强大残差抑制，调大更接近普通最小二乘；None 模式下不参与降权。
+gnss_robust_delta: 2.5
+# 初始水平残差门限（m，>= 0；0 关闭），只对上述初始对齐窗口内的 GNSS 生效。
+# 实际门限取本值与窗口内“残差中位数 + 6 × max(1.4826 × MAD, 0.10 m)”的较大值。
+# 窗口之后的 GNSS 不因初始 LIO 漂移提前删除，而是进入鲁棒优化后再检查残差。
+initial_outlier_gate_m: 3.0
+# 首轮优化后归一化残差平方和门限（无量纲，>= 0；0 关闭）：
+# chi² = (rE/σE)² + (rN/σN)² + (rU/σU)²，使用实际 GNSS 标准差，不含鲁棒核权重。
+# 超过门限的观测整点剔除后再优化一次；只有保留至少 3 点时才执行此次剔除。
+# 调小更严格，但可能删掉连续有效 GNSS；它不是单轴厘米级跳变阈值。
+postfit_outlier_chi2: 50.0
+
+# LIO 相对运动约束
+# 相对旋转标准差系数（度/√m，须 > 0）；边标准差 = 本值 × sqrt(d)。
+# 调小更信任 LIO 相对姿态，调大允许 GNSS 通过姿态调整来修正轨迹。
+odom_rotation_sigma_deg_per_sqrt_m: 0.02
+# 相对平移标准差系数（m/√m，须 > 0）；边标准差 = 本值 × sqrt(d)。
+# 调小更保留 LIO 相对位移，调大允许轨迹更容易被 GNSS 拉动。
+odom_translation_sigma_m_per_sqrt_m: 0.02
+# 边距离下限（m，须 > 0）：d = max(两端原始 LIO 位置的直线距离, 本值)。
+# 静止或短距离运动时也保留非零噪声，避免相对运动约束过硬；不是删边距离阈值。
+minimum_edge_distance_m: 0.10
+# 每个控制位姿与后续多少个控制位姿建立 LIO 相对运动边（整数，须 >= 1）。
+# 1 仅连接相邻位姿，3 连接后续第 1/2/3 个位姿；增大增加约束数量和计算量。
+odom_neighbor_span: 3
+
+# 控制位姿采样间隔（s，>= 0）：仅控制位姿作为优化变量，优化后的 ENU←odom
+# 修正变换插值回全部原始 LIO 位姿，输出仍是完整轨迹；首尾位姿保留。
+# 0 表示每个 LIO 位姿都参与优化；增大可减少变量，但降低修正的时间分辨率。
+control_pose_interval_s: 0.50
+# 每次 LM 优化最多迭代次数（整数，须 > 0）；收敛可提前停止，粗差剔除后另行迭代。
+max_iterations: 100

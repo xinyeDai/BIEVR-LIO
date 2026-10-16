@@ -1,21 +1,21 @@
 #include <bievr_lio/common.h>
 #include <bievr_lio/log++.h>
 #include <bievr_pgo/gnss_optimizer.h>
-#include <bievr_ros_common/conversions.h>
+#include <bievr_lio/scan_archive.h>
+#include <bievr_lio/utils.h>
 #include <ros/ros.h>
 #include <ros/master.h>
-#include <rosbag/bag.h>
-#include <rosbag/view.h>
-#include <sensor_msgs/NavSatFix.h>
+#include "bievr_lio_ros/pole_extractor.h"
+#include <yaml-cpp/yaml.h>
+#include <chrono>
 
 #include <Eigen/Geometry>
 
-#ifdef BIEVR_WITH_LIVOX
-#include <livox_ros_driver/CustomMsg.h>
-#endif
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cerrno>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -23,6 +23,7 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -30,12 +31,14 @@
 namespace {
 
 struct Options {
-  std::string bag;
+  std::string scans;
   std::string lio_trajectory;
+  std::string gnss_enu;
   std::string output_directory = "Log/gnss_optimization";
-  std::string gnss_topic = "/gnss";
-  std::string pointcloud_topic = "/livox/lidar";
   std::string output_map;
+  std::string poles_directory;
+  std::string pole_params_file;
+  bool skip_poles = false;
   double map_voxel_resolution_m = 0.15;
   double map_min_range_m = 1.0;
   double map_max_range_m = 100.0;
@@ -126,89 +129,70 @@ bool readTum(const std::string& path,
   return true;
 }
 
-class LocalEnu {
- public:
-  LocalEnu(double latitude_deg, double longitude_deg, double altitude_m)
-      : latitude_(latitude_deg * kPi / 180.0),
-        longitude_(longitude_deg * kPi / 180.0), origin_(ecef(latitude_deg, longitude_deg,
-                                                               altitude_m)) {
-    rotation_ << -std::sin(longitude_), std::cos(longitude_), 0.0,
-        -std::sin(latitude_) * std::cos(longitude_),
-        -std::sin(latitude_) * std::sin(longitude_), std::cos(latitude_),
-        std::cos(latitude_) * std::cos(longitude_),
-        std::cos(latitude_) * std::sin(longitude_), std::sin(latitude_);
-  }
-
-  bievr::V3 convert(double latitude_deg, double longitude_deg, double altitude_m) const {
-    return rotation_ * (ecef(latitude_deg, longitude_deg, altitude_m) - origin_);
-  }
-
- private:
-  static constexpr double kPi = 3.14159265358979323846;
-
-  static bievr::V3 ecef(double latitude_deg, double longitude_deg, double altitude_m) {
-    constexpr double semi_major_axis = 6378137.0;
-    constexpr double eccentricity_squared = 6.6943799901413165e-3;
-    const double latitude = latitude_deg * kPi / 180.0;
-    const double longitude = longitude_deg * kPi / 180.0;
-    const double sin_latitude = std::sin(latitude);
-    const double radius = semi_major_axis /
-                          std::sqrt(1.0 - eccentricity_squared * sin_latitude * sin_latitude);
-    return bievr::V3((radius + altitude_m) * std::cos(latitude) * std::cos(longitude),
-                     (radius + altitude_m) * std::cos(latitude) * std::sin(longitude),
-                     (radius * (1.0 - eccentricity_squared) + altitude_m) * sin_latitude);
-  }
-
-  double latitude_;
-  double longitude_;
-  bievr::V3 origin_;
-  bievr::M3 rotation_;
-};
-
-bool readGnss(const std::string& bag_path, const std::string& topic,
-              std::vector<bievr::GnssTrajectoryOptimizer::PositionMeasurement>& measurements,
-              bievr::V3& origin_lla, std::string& message) {
-  rosbag::Bag bag;
-  try {
-    bag.open(bag_path, rosbag::bagmode::Read);
-  } catch (const std::exception& error) {
-    message = std::string("Cannot open bag: ") + error.what();
+// Recorder format: metadata plus timestamp E N U varE varN varU.
+bool readGnssEnu(
+    const std::string& path,
+    std::vector<bievr::GnssTrajectoryOptimizer::PositionMeasurement>& measurements,
+    bievr::V3& origin_lla, std::string& message) {
+  std::ifstream input(path);
+  if (!input) {
+    message = "Cannot open GNSS ENU file '" + path + "'.";
     return false;
   }
-  std::vector<sensor_msgs::NavSatFix::ConstPtr> fixes;
-  for (const rosbag::MessageInstance& instance :
-       rosbag::View(bag, rosbag::TopicQuery({topic}))) {
-    const auto fix = instance.instantiate<sensor_msgs::NavSatFix>();
-    if (!fix || fix->status.status < sensor_msgs::NavSatStatus::STATUS_FIX ||
-        !std::isfinite(fix->latitude) || !std::isfinite(fix->longitude) ||
-        !std::isfinite(fix->altitude) || std::abs(fix->latitude) > 90.0 ||
-        std::abs(fix->longitude) > 180.0) {
+  measurements.clear();
+  bool have_origin = false;
+  std::string line;
+  size_t line_number = 0;
+  while (std::getline(input, line)) {
+    ++line_number;
+    std::istringstream stream(line);
+    stream >> std::ws;
+    if (stream.eof()) continue;
+    if (stream.peek() == '#') {
+      std::string marker, key;
+      stream >> marker >> key;
+      if (key != "origin_lla") continue;
+      if (!(stream >> origin_lla.x() >> origin_lla.y() >> origin_lla.z()) ||
+          !origin_lla.allFinite() || std::abs(origin_lla.x()) > 90.0 ||
+          std::abs(origin_lla.y()) > 180.0 || have_origin) {
+        message = "Invalid or repeated origin_lla in '" + path + "'.";
+        return false;
+      }
+      have_origin = true;
       continue;
     }
-    fixes.push_back(fix);
+    std::string timestamp, extra;
+    ros::Time stamp;
+    bievr::V3 position, variance;
+    bool valid_stamp = false;
+    if (stream >> timestamp >> position.x() >> position.y() >> position.z() >>
+        variance.x() >> variance.y() >> variance.z()) {
+      // ROS time parses seconds/nanoseconds separately to retain nanosecond precision.
+      const auto dot = timestamp.find('.');
+      const std::string seconds = timestamp.substr(0, dot);
+      std::string fraction = dot == std::string::npos ? "" : timestamp.substr(dot + 1);
+      if (!seconds.empty() && seconds.find_first_not_of("0123456789") == std::string::npos &&
+          fraction.size() <= 9 && fraction.find_first_not_of("0123456789") == std::string::npos) {
+        fraction.append(9 - fraction.size(), '0');
+        try {
+          const auto sec = std::stoull(seconds);
+          if (sec <= std::numeric_limits<uint32_t>::max()) {
+            stamp = ros::Time(static_cast<uint32_t>(sec), std::stoul(fraction));
+            valid_stamp = true;
+          }
+        } catch (const std::exception&) {}
+      }
+    }
+    if (!valid_stamp || !position.allFinite() || !variance.allFinite() ||
+        (variance.array() < 0.0).any() || (stream >> extra)) {
+      message = "Malformed GNSS ENU row " + std::to_string(line_number) + " in '" + path + "'.";
+      return false;
+    }
+    measurements.push_back({stamp.toNSec(), position, variance});
   }
-  bag.close();
-  if (fixes.size() < 3) {
-    message = "Topic '" + topic + "' contains fewer than three valid NavSatFix messages.";
+  if (input.bad() || !have_origin || measurements.size() < 3) {
+    message = "GNSS ENU file requires # origin_lla lat lon alt and at least three valid measurements.";
     return false;
-  }
-  origin_lla = bievr::V3(fixes.front()->latitude, fixes.front()->longitude,
-                         fixes.front()->altitude);
-  const LocalEnu converter(origin_lla.x(), origin_lla.y(), origin_lla.z());
-  measurements.clear();
-  measurements.reserve(fixes.size());
-  for (const auto& fix : fixes) {
-    bievr::V3 variance(1.0, 1.0, 4.0);
-    if (fix->position_covariance_type != sensor_msgs::NavSatFix::COVARIANCE_TYPE_UNKNOWN) {
-      variance = bievr::V3(fix->position_covariance[0], fix->position_covariance[4],
-                           fix->position_covariance[8]);
-    }
-    if (!variance.allFinite() || (variance.array() < 0.0).any()) {
-      variance = bievr::V3(1.0, 1.0, 4.0);
-    }
-    measurements.push_back({fix->header.stamp.toNSec(),
-                            converter.convert(fix->latitude, fix->longitude, fix->altitude),
-                            variance});
   }
   return true;
 }
@@ -219,7 +203,21 @@ bool interpolatePose(const std::vector<bievr::GnssTrajectoryOptimizer::StampedPo
   const auto upper = std::lower_bound(
       poses.begin(), poses.end(), stamp,
       [](const auto& value, uint64_t time) { return value.stamp < time; });
-  if (upper == poses.begin() || upper == poses.end()) return false;
+  if (upper != poses.end() && upper->stamp == stamp) {
+    pose = upper->pose;
+    return true;
+  }
+  // Existing TUM logs serialize epoch seconds through double (sub-microsecond rounding).
+  if (upper == poses.begin()) {
+    if (poses.front().stamp - stamp > 1000) return false;
+    pose = poses.front().pose;
+    return true;
+  }
+  if (upper == poses.end()) {
+    if (stamp - poses.back().stamp > 1000) return false;
+    pose = poses.back().pose;
+    return true;
+  }
   const auto& second = *upper;
   const auto& first = *(upper - 1);
   if (second.stamp <= first.stamp) return false;
@@ -237,109 +235,54 @@ bool saveOptimizedPointcloudMap(
     const Options& options,
     const std::vector<bievr::GnssTrajectoryOptimizer::StampedPose>& optimized,
     std::string& message) {
-#ifndef BIEVR_WITH_LIVOX
-  (void)options;
-  (void)optimized;
-  message = "GNSS map output requires the Livox ROS driver at build time.";
-  return false;
-#else
-  if (options.output_map.empty() || options.map_voxel_resolution_m <= 0.0 ||
-      options.map_min_range_m < 0.0 ||
+  if (options.output_map.empty() || !std::isfinite(options.map_voxel_resolution_m) ||
+      options.map_voxel_resolution_m <= 0.0 || !std::isfinite(options.map_min_range_m) ||
+      options.map_min_range_m < 0.0 || !std::isfinite(options.map_max_range_m) ||
       options.map_max_range_m <= options.map_min_range_m) {
-    message = "Invalid GNSS map output path, voxel resolution, or range filter.";
-    return false;
-  }
-  rosbag::Bag bag;
-  try {
-    bag.open(options.bag, rosbag::bagmode::Read);
-  } catch (const std::exception& error) {
-    message = std::string("Cannot open bag for pointcloud map: ") + error.what();
+    message = "Invalid map output path, voxel resolution, or range filter.";
     return false;
   }
   std::unordered_map<VoxelKey, bievr::IntensityPoint, VoxelKeyHash> voxels;
-  size_t scans = 0;
-  size_t skipped_scans = 0;
-  size_t input_points = 0;
+  size_t scans = 0, skipped_scans = 0, input_points = 0;
   const double inverse_resolution = 1.0 / options.map_voxel_resolution_m;
-  auto accumulateCloud = [&](const bievr::StampedIntensityPointcloud& cloud,
-                             size_t& scan_count, size_t& skipped_count,
-                             size_t& point_count) {
-    if (cloud.empty()) return;
-    ++scan_count;
-    bievr::Transform start_pose;
-    bievr::Transform end_pose;
-    if (!interpolatePose(optimized, cloud.stamp, start_pose) ||
-        !interpolatePose(optimized, cloud.end_stamp, end_pose)) {
-      ++skipped_count;
-      return;
-    }
-    constexpr size_t kDeskewBins = 32;
-    std::array<bievr::Transform, kDeskewBins + 1> deskew_poses;
-    const bievr::Quaternion start_q(start_pose.rotation());
-    const bievr::Quaternion end_q(end_pose.rotation());
-    for (size_t bin = 0; bin <= kDeskewBins; ++bin) {
-      const double alpha = static_cast<double>(bin) / kDeskewBins;
-      const bievr::Quaternion q = start_q.slerp(alpha, end_q).normalized();
-      const bievr::V3 translation =
-          (1.0 - alpha) * start_pose.translation() + alpha * end_pose.translation();
-      deskew_poses[bin] = bievr::Transform(q, translation);
-    }
-    const double duration_s = static_cast<double>(cloud.end_stamp - cloud.stamp) * 1e-9;
-    for (size_t index = 0; index < cloud.size(); ++index) {
-      const bievr::V3 point_sensor = cloud[index].head<3>();
-      const double range = point_sensor.norm();
-      if (!point_sensor.allFinite() || range < options.map_min_range_m ||
-          range > options.map_max_range_m) {
+  try {
+    bievr::ScanArchiveReader archive(options.scans);
+    uint64_t stamp;
+    bievr::IntensityPointcloud cloud;
+    while (archive.next(stamp, cloud)) {
+      ++scans;
+      bievr::Transform pose;
+      if (!interpolatePose(optimized, stamp, pose)) {
+        ++skipped_scans;
         continue;
       }
-      const double alpha = duration_s > 1e-9
-                               ? std::clamp(cloud[index]
-                                                [bievr::StampedIntensityPointcloud::kTimeRow] /
-                                                duration_s,
-                                            0.0, 1.0)
-                               : 1.0;
-      const size_t bin = static_cast<size_t>(
-          std::llround(alpha * static_cast<double>(kDeskewBins)));
-      ++point_count;
-      // The Xiangyang calibration uses identity LiDAR->IMU extrinsics. For a
-      // non-identity calibration, apply T_I_L here before applying the pose.
-      const bievr::V3 point_world = deskew_poses[bin] * point_sensor;
-      const VoxelKey key{
-          static_cast<int>(std::floor(point_world.x() * inverse_resolution)),
-          static_cast<int>(std::floor(point_world.y() * inverse_resolution)),
-          static_cast<int>(std::floor(point_world.z() * inverse_resolution))};
-      if (voxels.find(key) == voxels.end()) {
-        bievr::IntensityPoint point;
-        point << point_world, cloud[index][bievr::StampedIntensityPointcloud::kIntensityRow];
-        voxels.emplace(key, point);
-      }
-    }
-  };
-  for (const rosbag::MessageInstance& instance :
-       rosbag::View(bag, rosbag::TopicQuery({options.pointcloud_topic}))) {
-#ifdef BIEVR_WITH_LIVOX
-    const auto cloud_message = instance.instantiate<livox_ros_driver::CustomMsg>();
-    if (cloud_message) {
-      bievr::StampedIntensityPointcloud cloud;
-      if (bievr::msgToPointcloud(*cloud_message, cloud)) {
-        accumulateCloud(cloud, scans, skipped_scans, input_points);
-      }
-      continue;
-    }
-#endif
-    if (instance.getDataType() == "sensor_msgs/PointCloud2") {
-      const auto cloud_message = instance.instantiate<sensor_msgs::PointCloud2>();
-      if (cloud_message) {
-        bievr::StampedIntensityPointcloud cloud;
-        if (bievr::msgToPointcloud(*cloud_message, cloud)) {
-          accumulateCloud(cloud, scans, skipped_scans, input_points);
+      for (size_t i = 0; i < cloud.size(); ++i) {
+        const bievr::V3 body = cloud[i].head<3>();
+        const double range = body.norm();
+        if (!body.allFinite() || range < options.map_min_range_m ||
+            range > options.map_max_range_m) continue;
+        const bievr::V3 world = pose * body;
+        const bievr::V3 cell = (world * inverse_resolution).array().floor();
+        if (!cell.allFinite() || (cell.array() < std::numeric_limits<int>::min()).any() ||
+            (cell.array() > std::numeric_limits<int>::max()).any()) {
+          throw std::runtime_error("Map voxel index out of range.");
+        }
+        const VoxelKey key{static_cast<int>(cell.x()), static_cast<int>(cell.y()),
+                           static_cast<int>(cell.z())};
+        ++input_points;
+        if (voxels.find(key) == voxels.end()) {
+          bievr::IntensityPoint point;
+          point << world, cloud[i][3];
+          voxels.emplace(key, point);
         }
       }
     }
+  } catch (const std::exception& error) {
+    message = error.what();
+    return false;
   }
-  bag.close();
   if (voxels.empty()) {
-    message = "No pointclouds overlapped the optimized LIO trajectory.";
+    message = "No archived points overlap the optimized trajectory and range filter.";
     return false;
   }
   bievr::IntensityPointcloud map;
@@ -351,12 +294,143 @@ bool saveOptimizedPointcloudMap(
     return false;
   }
   std::ostringstream stream;
-  stream << "Saved optimized pointcloud map to '" << options.output_map << "' ("
-         << map.size() << " voxels from " << scans << " scans, " << input_points
+  stream << "Saved optimized map to '" << options.output_map << "' (" << map.size()
+         << " voxels from " << scans << " archived scans, " << input_points
          << " input points, " << skipped_scans << " scans outside trajectory).";
   message = stream.str();
   return true;
-#endif
+}
+
+// Rebuild from body-frame measurements, avoiding timestamp guesses for merged
+// PCDs and avoiding applying a second correction to already optimized results.
+bool rebuildPoles(const Options& options,
+                  const std::vector<bievr::GnssTrajectoryOptimizer::StampedPose>& optimized,
+                  std::string& message) {
+  namespace fs = std::filesystem;
+  const fs::path directory(options.poles_directory);
+  if (options.skip_poles) {
+    message = "Skipping pole/rail rebuilding by request.";
+    return true;
+  }
+  if (!fs::is_regular_file(directory / "landmarks.txt")) {
+    message = "No existing pole map in '" + directory.string() + "'; skipping pole/rail rebuilding.";
+    return true;
+  }
+  if (!fs::is_regular_file(options.scans)) {
+    message = "Existing pole map requires scan archive '" + options.scans +
+        "' for GNSS rebuilding. Use --skip-poles to leave it unchanged.";
+    return false;
+  }
+  const std::string suffix = std::to_string(
+      std::chrono::system_clock::now().time_since_epoch().count()) + "_" + std::to_string(getpid());
+  const fs::path staging = directory.string() + ".gnss_pending_" + suffix;
+  const fs::path backup = directory.string() + ".before_gnss_" + suffix;
+  bool moved_original = false;
+  try {
+    if (!fs::create_directory(staging)) throw std::runtime_error("Cannot create pole staging directory.");
+    fs::path params = options.pole_params_file;
+    if (params.empty()) {
+      params = directory / "extraction_config.yaml";
+      if (!fs::is_regular_file(params)) {
+        params = fs::path(__FILE__).parent_path().parent_path().parent_path().parent_path() /
+                 "config/params.yaml";
+        LOG(W, "Existing pole map has no extraction_config.yaml; using '" << params.string()
+               << "'. Use --pole_params_file to select its original extraction settings.");
+      }
+    }
+    // Disable localization and any prior mapping trajectory before validation.
+    const fs::path overlay_path = staging / "rebuild_overlay.yaml";
+    YAML::Node overlay;
+    overlay["pole_extraction"]["enable"] = true;
+    overlay["pole_extraction"]["localization_enable"] = false;
+    overlay["pole_extraction"]["mapping_trajectory_path"] = "";
+    overlay["pole_extraction"]["output_directory"] = staging.string();
+    overlay["rail_extraction"]["enable"] = fs::is_regular_file(directory / "rail_vector_map.txt");
+    if (fs::is_regular_file(directory / "poles.pcd"))
+      overlay["pole_extraction"]["save_keyframe_clouds"] = true;
+    {
+      std::ofstream file(overlay_path);
+      file << overlay << "\n";
+      file.close();
+      if (!file) throw std::runtime_error("Cannot write pole rebuild settings.");
+    }
+    bievr::PoleExtractionConfig config;
+    if (!bievr::loadPoleExtractionConfig({params.string(), overlay_path.string()}, config))
+      throw std::runtime_error("Invalid pole extraction settings.");
+    bievr::PoleExtractor extractor(config, "map");
+    bievr::ScanArchiveReader archive(options.scans);
+    uint64_t stamp;
+    bievr::IntensityPointcloud scan;
+    size_t accepted = 0, skipped = 0;
+    while (archive.next(stamp, scan)) {
+      bievr::Transform pose;
+      if (!interpolatePose(optimized, stamp, pose)) { ++skipped; continue; }
+      bievr::Pointcloud points;
+      points.resize(scan.size());
+      for (size_t i = 0; i < scan.size(); ++i) points.data().col(i) = scan[i].head<3>();
+      extractor.addFrame(stamp, pose, points);
+      ++accepted;
+    }
+    extractor.finish();
+    const auto stats = extractor.stats();
+    if (accepted == 0 || stats.processed_keyframes == 0 || stats.dropped_keyframes != 0)
+      throw std::runtime_error("Pole rebuilding produced no keyframes or dropped input data.");
+    auto has_records = [](const fs::path& path) {
+      std::ifstream input(path);
+      std::string line;
+      std::getline(input, line); // table header
+      while (std::getline(input, line)) {
+        if (line.find_first_not_of(" \t\r") != std::string::npos) return true;
+      }
+      return false;
+    };
+    if ((stats.landmarks == 0 && has_records(directory / "landmarks.txt")) ||
+        (config.rail_enable && stats.rail_samples == 0 &&
+         has_records(directory / "rail_vector_map.txt"))) {
+      throw std::runtime_error("Rebuilding would erase a nonempty pole/rail map; check extraction parameters.");
+    }
+    if (!extractor.saveResults(&message)) throw std::runtime_error(message);
+    fs::remove(overlay_path);
+    // Persist the final path rather than the temporary transaction directory.
+    const fs::path snapshot_path = staging / "extraction_config.yaml";
+    YAML::Node snapshot = YAML::LoadFile(snapshot_path.string());
+    snapshot["pole_extraction"]["output_directory"] = directory.string();
+    {
+      std::ofstream file(snapshot_path);
+      file << snapshot << "\n";
+      file.close();
+      if (!file) throw std::runtime_error("Cannot finalize extraction configuration.");
+    }
+    {
+      YAML::Node provenance;
+      provenance["coordinate_frame"] = "map_enu";
+      provenance["method"] = "reextract_from_body_scans";
+      provenance["optimized_trajectory"] = (fs::path(options.output_directory) / "gnss_optimized_tum.txt").string();
+      provenance["scans"] = options.scans;
+      provenance["accepted_scans"] = accepted;
+      provenance["skipped_scans"] = skipped;
+      provenance["original_backup"] = backup.string();
+      std::ofstream file(staging / "gnss_optimization.yaml");
+      file << provenance << "\n";
+      file.close();
+      if (!file) throw std::runtime_error("Cannot write pole optimization provenance.");
+    }
+    fs::rename(directory, backup);
+    moved_original = true;
+    fs::rename(staging, directory);
+    moved_original = false;
+    message = "Rebuilt GNSS-optimized poles/rails in '" + directory.string() +
+        "' from " + std::to_string(accepted) + " scans (" + std::to_string(skipped) +
+        " outside trajectory). Original results backed up to '" + backup.string() + "'.";
+    return true;
+  } catch (const std::exception& error) {
+    std::error_code cleanup_error;
+    if (moved_original) fs::rename(backup, directory, cleanup_error);
+    message = "Failed to rebuild pole/rail map: " + std::string(error.what());
+    if (cleanup_error) message += ". Original results remain at '" + backup.string() + "'.";
+    fs::remove_all(staging, cleanup_error);
+    return false;
+  }
 }
 
 bool writeOutputs(
@@ -374,9 +448,10 @@ bool writeOutputs(
   }
   const fs::path directory(options.output_directory);
   std::ofstream tum(directory / "gnss_optimized_tum.txt");
+  std::ofstream aligned(directory / "lio_aligned_enu_tum.txt");
   std::ofstream summary(directory / "summary.yaml");
   std::ofstream seed(directory / "initial_correction.yaml");
-  if (!tum || !summary || !seed) {
+  if (!tum || !aligned || !summary || !seed) {
     message = "Cannot open one or more GNSS optimization output files.";
     return false;
   }
@@ -387,6 +462,14 @@ bool writeOutputs(
     tum << static_cast<double>(stamped.stamp) * 1.0e-9 << " " << p.x() << " " << p.y()
         << " " << p.z() << " " << q.x() << " " << q.y() << " " << q.z() << " "
         << q.w() << "\n";
+  }
+  aligned << std::fixed << std::setprecision(9);
+  for (const auto& stamped : raw) {
+    const bievr::Transform pose(stats.initial_T_enu_odom * stamped.pose);
+    const bievr::V3 p = pose.translation();
+    const bievr::Quaternion q(pose.rotation());
+    aligned << static_cast<double>(stamped.stamp) * 1e-9 << " " << p.x() << " " << p.y()
+            << " " << p.z() << " " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
   }
   const bievr::Transform T_enu_odom =
       optimized.front().pose * raw.front().pose.inverse();
@@ -406,14 +489,15 @@ bool writeOutputs(
        << ", " << correction_orientation.w() << "]\n"
        << "  localization_initial_yaw_deg: " << yaw_deg << "\n";
   summary << std::fixed << std::setprecision(9)
-          << "bag: \"" << options.bag << "\"\n"
-          << "gnss_topic: \"" << options.gnss_topic << "\"\n"
-          << "pointcloud_topic: \"" << options.pointcloud_topic << "\"\n"
+          << "gnss_enu: \"" << fs::absolute(options.gnss_enu).string() << "\"\n"
+          << "scans: \"" << options.scans << "\"\n"
           << "optimized_map: \"" << options.output_map << "\"\n"
           << "map_voxel_resolution_m: " << options.map_voxel_resolution_m << "\n"
           << "map_min_range_m: " << options.map_min_range_m << "\n"
           << "map_max_range_m: " << options.map_max_range_m << "\n"
-          << "map_deskew_bins: 32\n"
+          << "scan_frame: body\n"
+          << "scans_already_deskewed: true\n"
+          << "evaluation_max_time_gap_s: " << config.max_time_gap_s << "\n"
           << "lio_trajectory: \"" << options.lio_trajectory << "\"\n"
           << "origin_lla: [" << origin_lla.x() << ", " << origin_lla.y() << ", "
           << origin_lla.z() << "]\n"
@@ -424,6 +508,17 @@ bool writeOutputs(
           << "rejected_time: " << stats.rejected_time << "\n"
           << "rejected_outlier: " << stats.rejected_outlier << "\n"
           << "rejected_postfit: " << stats.rejected_postfit << "\n"
+          << "initial_alignment_duration_s: " << config.initial_alignment_duration_s << "\n"
+          << "initial_alignment_min_baseline_m: "
+          << config.initial_alignment_min_baseline_m << "\n"
+          << "initial_alignment_measurements: " << stats.initial_alignment_measurements << "\n"
+          << "initial_alignment_start_offset_s: "
+          << stats.initial_alignment_start_offset_s << "\n"
+          << "initial_alignment_span_s: " << stats.initial_alignment_span_s << "\n"
+          << "effective_initial_outlier_gate_m: "
+          << stats.effective_initial_outlier_gate_m << "\n"
+          << "initial_outlier_gate_m: " << config.initial_outlier_gate_m << "\n"
+          << "initial_outlier_gate_scope: alignment_window\n"
           << "gnss_robust_kernel: \"" << config.gnss_robust_kernel << "\"\n"
           << "gnss_robust_delta: " << config.gnss_robust_delta << "\n"
           << "gnss_covariance_scale: " << config.gnss_covariance_scale << "\n"
@@ -448,12 +543,38 @@ bool writeOutputs(
           << correction_orientation.y() << ", " << correction_orientation.z() << ", "
           << correction_orientation.w() << "]\n"
           << "seed_yaw_deg: " << yaw_deg << "\n";
-  if (!tum || !summary || !seed) {
+  if (!tum || !aligned || !summary || !seed) {
     message = "Failed while writing GNSS optimization outputs.";
     return false;
   }
   message = "Saved GNSS-optimized trajectory and pole-localization seed to '" +
             options.output_directory + "'.";
+  return true;
+}
+
+bool writeEvaluation(const std::string& output_directory, std::string& message) {
+  // The plotting script is installed beside this executable, also in catkin devel space.
+  const auto script = std::filesystem::canonical("/proc/self/exe").parent_path() /
+                      "plot_gnss_optimization.py";
+  const pid_t child = fork();
+  if (child < 0) {
+    message = "Cannot start GNSS evaluation process.";
+    return false;
+  }
+  if (child == 0) {
+    execlp("python3", "python3", script.c_str(), "--output_directory",
+           output_directory.c_str(), static_cast<char*>(nullptr));
+    _exit(127);
+  }
+  int status = 0;
+  pid_t waited;
+  do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+  if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    message = "GNSS evaluation/plotting failed; trajectory outputs were saved. "
+              "Check the Python error above (numpy, matplotlib and yaml are required).";
+    return false;
+  }
+  message = "Saved GNSS RMSE/MAX reports and XYZ trajectory/error plots to '" + output_directory + "'.";
   return true;
 }
 
@@ -464,12 +585,22 @@ int main(int argc, char** argv) {
   Options options;
   bievr::GnssTrajectoryOptimizer::Config config;
   const std::vector<std::string> args(argv, argv + argc);
-  commandLineValue(args, "--bag", options.bag);
+  for (const auto& arg : args) {
+    if (arg == "--bag" || arg.rfind("--bag=", 0) == 0) {
+      LOG(E, "--bag has been removed. Use --gnss_enu FILE and --scans FILE.");
+      return 2;
+    }
+  }
+  commandLineValue(args, "--scans", options.scans);
+  commandLineValue(args, "--gnss_enu", options.gnss_enu);
   commandLineValue(args, "--lio_trajectory", options.lio_trajectory);
   commandLineValue(args, "--output_directory", options.output_directory);
-  commandLineValue(args, "--gnss_topic", options.gnss_topic);
-  commandLineValue(args, "--pointcloud_topic", options.pointcloud_topic);
   commandLineValue(args, "--output_map", options.output_map);
+  commandLineValue(args, "--poles_directory", options.poles_directory);
+  commandLineValue(args, "--pole_params_file", options.pole_params_file);
+  options.skip_poles = std::find(args.begin(), args.end(), "--skip-poles") != args.end();
+  bool skip_output_map =
+      std::find(args.begin(), args.end(), "--skip-output-map") != args.end();
   std::string map_resolution;
   if (commandLineValue(args, "--map_voxel_resolution_m", map_resolution)) {
     try {
@@ -481,13 +612,16 @@ int main(int argc, char** argv) {
   }
   // A roslaunch invocation has a master and can configure private parameters.
   // Direct offline CLI use intentionally does not require roscore.
-  if ((options.bag.empty() || options.lio_trajectory.empty()) && ros::master::check()) {
+  if ((options.gnss_enu.empty() || options.lio_trajectory.empty()) && ros::master::check()) {
     ros::NodeHandle private_node("~");
-    private_node.param("bag", options.bag, options.bag);
+    private_node.param("skip_output_map", skip_output_map, skip_output_map);
+    private_node.param("skip_poles", options.skip_poles, options.skip_poles);
+    private_node.param("poles_directory", options.poles_directory, options.poles_directory);
+    private_node.param("pole_params_file", options.pole_params_file, options.pole_params_file);
+    private_node.param("scans", options.scans, options.scans);
+    private_node.param("gnss_enu", options.gnss_enu, options.gnss_enu);
     private_node.param("lio_trajectory", options.lio_trajectory, options.lio_trajectory);
     private_node.param("output_directory", options.output_directory, options.output_directory);
-    private_node.param("gnss_topic", options.gnss_topic, options.gnss_topic);
-    private_node.param("pointcloud_topic", options.pointcloud_topic, options.pointcloud_topic);
     private_node.param("output_map", options.output_map, options.output_map);
     private_node.param("map_voxel_resolution_m", options.map_voxel_resolution_m,
                        options.map_voxel_resolution_m);
@@ -506,6 +640,11 @@ int main(int argc, char** argv) {
                        config.gnss_robust_kernel);
     private_node.param("gnss_robust_delta", config.gnss_robust_delta,
                        config.gnss_robust_delta);
+    private_node.param("initial_alignment_duration_s", config.initial_alignment_duration_s,
+                       config.initial_alignment_duration_s);
+    private_node.param("initial_alignment_min_baseline_m",
+                       config.initial_alignment_min_baseline_m,
+                       config.initial_alignment_min_baseline_m);
     private_node.param("initial_outlier_gate_m", config.initial_outlier_gate_m,
                        config.initial_outlier_gate_m);
     private_node.param("postfit_outlier_chi2", config.postfit_outlier_chi2,
@@ -536,15 +675,34 @@ int main(int argc, char** argv) {
           bievr::V3(sigma_override[0], sigma_override[1], sigma_override[2]);
     }
   }
-  if (options.bag.empty() || options.lio_trajectory.empty()) {
-    LOG(E, "Usage: gnss_optimize --bag BAG --lio_trajectory TRAJECTORY "
-           "[--output_directory DIR] [--gnss_topic /gnss] "
-           "[--pointcloud_topic /livox/lidar] [--output_map MAP.pcd]");
+  if (options.gnss_enu.empty() || options.lio_trajectory.empty()) {
+    LOG(E, "Usage: gnss_optimize --gnss_enu FILE --lio_trajectory TRAJECTORY "
+           "[--scans FILE] [--output_directory DIR] [--output_map MAP.pcd] "
+           "[--skip-output-map] [--poles_directory DIR] [--pole_params_file YAML] [--skip-poles]");
     return 2;
   }
-  if (options.output_map.empty()) {
+  if (options.poles_directory.empty()) {
+    options.poles_directory = (std::filesystem::path(options.lio_trajectory).parent_path() / "poles").string();
+  }
+  const bool write_map = !skip_output_map;
+  if (options.scans.empty()) {
+    options.scans = (std::filesystem::path(options.gnss_enu).parent_path() / "scans.bin").string();
+  }
+  if (skip_output_map) options.output_map.clear();
+  if (write_map && options.output_map.empty()) {
     options.output_map = (std::filesystem::path(options.output_directory) /
                           "gnss_optimized_map.pcd").string();
+  }
+  std::error_code directory_error;
+  std::filesystem::create_directories(options.output_directory, directory_error);
+  if (directory_error) {
+    LOG(E, "Cannot create output directory: " << directory_error.message());
+    return 1;
+  }
+  if (write_map && !std::filesystem::is_regular_file(options.scans)) {
+    LOG(E, "Missing scan archive '" << options.scans
+           << "'. Record a new run, or use --skip-output-map for trajectory only.");
+    return 1;
   }
 
   std::string message;
@@ -555,7 +713,7 @@ int main(int argc, char** argv) {
   }
   std::vector<bievr::GnssTrajectoryOptimizer::PositionMeasurement> gnss;
   bievr::V3 origin_lla;
-  if (!readGnss(options.bag, options.gnss_topic, gnss, origin_lla, message)) {
+  if (!readGnssEnu(options.gnss_enu, gnss, origin_lla, message)) {
     LOG(E, message);
     return 1;
   }
@@ -567,12 +725,26 @@ int main(int argc, char** argv) {
     return 1;
   }
   LOG(I, message);
-  if (!saveOptimizedPointcloudMap(options, optimized, message)) {
+  if (write_map) {
+    if (!saveOptimizedPointcloudMap(options, optimized, message)) {
+      LOG(E, message);
+      return 1;
+    }
+    LOG(I, message);
+  } else {
+    LOG(I, "Skipping GNSS-optimized dense pointcloud map by request.");
+  }
+  if (!writeOutputs(options, origin_lla, lio, optimized, config, stats, message)) {
     LOG(E, message);
     return 1;
   }
   LOG(I, message);
-  if (!writeOutputs(options, origin_lla, lio, optimized, config, stats, message)) {
+  if (!rebuildPoles(options, optimized, message)) {
+    LOG(E, message);
+    return 1;
+  }
+  LOG(I, message);
+  if (!writeEvaluation(options.output_directory, message)) {
     LOG(E, message);
     return 1;
   }

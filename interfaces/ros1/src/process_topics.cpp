@@ -122,6 +122,11 @@ int main(int argc, char** argv) {
         nh, pipeline, pole_localization_config, "bievr_lio"));
     pole_extractor->setCorrectionProvider(
         [&pole_localization]() { return pole_localization->correction(); });
+    pole_extractor->setKeyframeObserver(
+        [&pole_localization](uint64_t stamp, const bievr::Transform& pose,
+                             double odom_distance_m) {
+          pole_localization->addKeyframe(stamp, pose, odom_distance_m);
+        });
     pole_extractor->setCorrectionObserver(
         [&pole_localization](const bievr::PoleLocalizationCorrection& correction) {
           pole_localization->addPoleCorrection(correction);

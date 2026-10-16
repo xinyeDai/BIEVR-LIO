@@ -283,6 +283,7 @@ inline bool loadConfigFromYaml(const std::vector<std::string>& yaml_paths, Confi
   hc.max_path_poses = static_cast<size_t>(max_path_poses);
 
   // --- map saving (accumulated registered scans, written by the save service) ---
+  hc.record_gnss_scans = yaml.get<bool>("gnss_recorder", "enable", false);
   hc.accumulate_map = yaml.get<bool>("map_save", "accumulate", true);
   hc.map_save_path = yaml.get<std::string>("map_save", "path", "");
   if (!config_internal::getPositive(yaml, "map_save", "resolution_m", 0.1,

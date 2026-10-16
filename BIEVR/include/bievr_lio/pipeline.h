@@ -9,6 +9,7 @@
 #include "bievr_lio/ls_optimizer.h"
 #include "bievr_lio/map_accumulator.h"
 #include "bievr_lio/preprocess.h"
+#include "bievr_lio/scan_archive.h"
 #include "bievr_lio/utils.h"
 
 namespace bievr {
@@ -35,6 +36,7 @@ class Pipeline {
     std::string log_path = "";
     // Accumulate the registered scans into a world-frame cloud that saveMap()
     // can write out. Off means saveMap() has nothing to save.
+    bool record_gnss_scans = false;
     bool accumulate_map = true;
     double map_save_resolution = 0.1;
     std::string map_save_path = "";
@@ -157,6 +159,7 @@ class Pipeline {
   // Collects the registered scans for saveMap() on its own thread. Null when
   // map accumulation is disabled.
   std::unique_ptr<MapAccumulator> map_accumulator_;
+  std::unique_ptr<ScanArchiveWriter> scan_archive_;
   // Accelerometer scale resolved during bias estimation (1 if raw, g if the IMU
   // reports gravity-normalized accelerations). Applied to all incoming IMU data.
   double imu_acc_scale_ = 1.0;

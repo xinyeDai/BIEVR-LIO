@@ -2,6 +2,7 @@
 #define BIEVR_LIO_ROS_POLE_LOCALIZATION_H_
 
 #include <bievr_lio/pipeline.h>
+#include <bievr_pgo/sparse_localization_graph.h>
 #include <geometry_msgs/PoseWithCovarianceStamped.h>
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
@@ -30,6 +31,10 @@ struct PoleLocalizationConfig {
   std::string output_directory = "Log/pole_localization";
 
   bool filter_enable = true;
+  bool factor_graph_enable = true;
+  double factor_graph_huber_delta = 2.5;
+  double factor_graph_prior_translation_sigma_m = 0.50;
+  double factor_graph_prior_rotation_sigma_deg = 2.0;
   // Railway LIO can accumulate metre-level horizontal drift over one
   // kilometre. These values let a high-quality multi-pole correction track
   // that slow drift without weakening the matcher's geometric gates.
@@ -46,6 +51,10 @@ struct PoleLocalizationConfig {
   double max_innovation_yaw_deg = 2.0;
   double max_innovation_z_m = 1.0;
   double max_innovation_tilt_deg = 2.0;
+  double rail_mahalanobis_gate = 36.0;
+  // After this much travel without an accepted rail update, a good rail fit
+  // is treated as a fresh vertical fix instead of a small tracking update.
+  double rail_rebootstrap_gap_m = 100.0;
 
   int initial_confirmations = 2;
   int recovery_confirmations = 2;
@@ -89,6 +98,8 @@ class PoleLocalization {
   // Returns a seed even while SEARCHING, allowing the pole matcher to refine a
   // manual /initialpose before this class declares localization TRACKING.
   std::optional<Transform> correction() const;
+  void addKeyframe(uint64_t stamp, const Transform& T_odom_body,
+                   double odom_distance_m);
   void addPoleCorrection(const PoleLocalizationCorrection& correction);
 
   Status status() const;
@@ -102,6 +113,8 @@ class PoleLocalization {
   void onInitialPose(const geometry_msgs::PoseWithCovarianceStamped::ConstPtr& message);
   void publishStatus(Status status);
   Transform correctionLocked() const;
+  void syncStateFromCorrectionLocked(const Transform& correction);
+  void rewriteTrajectoryFromGraphLocked();
   void addRailCorrection(const PoleLocalizationCorrection& correction);
   void rewriteTrajectoryTailLocked(uint64_t stamp, const Transform& correction);
 
@@ -127,6 +140,7 @@ class PoleLocalization {
   };
 
   PoleLocalizationConfig config_;
+  std::unique_ptr<SparseLocalizationGraph> graph_;
   std::string odom_frame_;
   std::string body_frame_;
 
@@ -140,10 +154,17 @@ class PoleLocalization {
   // measurements; pole updates continue to affect the planar state only.
   Eigen::Vector3d vertical_state_ = Eigen::Vector3d::Zero();
   Eigen::Matrix3d vertical_covariance_ = Eigen::Matrix3d::Identity();
+  // The configured/map seed initializes the planar search, but its vertical
+  // component can be tens of metres wrong after a long LIO run.  The first
+  // geometrically verified rail observation therefore bootstraps this state;
+  // subsequent observations use the normal innovation gates.
+  bool have_rail_vertical_fix_ = false;
+  double last_rail_fix_distance_m_ = 0.0;
   Status status_ = Status::Uninitialized;
   int confirmations_ = 0;
 
   bool have_odom_ = false;
+  uint64_t latest_odom_stamp_ = 0;
   Transform latest_odom_;
   V3 last_odom_position_ = V3::Zero();
   double odom_distance_m_ = 0.0;

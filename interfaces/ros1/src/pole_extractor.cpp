@@ -284,6 +284,80 @@ struct RailSample {
   double quality = 0.0;
 };
 
+// Continuous piecewise-linear representation built from adjacent samples in
+// the existing rail-vector map. Keeping this as a derived structure preserves
+// compatibility with every rail_vector_map.txt already produced by the
+// mapper, while localization no longer quantizes correspondences to samples.
+struct RailSegment {
+  RailSample start;
+  RailSample finish;
+  V3 center_start = V3::Zero();
+  V3 center_finish = V3::Zero();
+  V3 tangent = V3::UnitX();
+};
+
+std::vector<RailSegment> buildRailSegments(const std::vector<RailSample>& samples) {
+  std::vector<RailSegment> segments;
+  if (samples.size() < 2) return segments;
+  segments.reserve(samples.size() - 1);
+  for (size_t i = 0; i + 1 < samples.size(); ++i) {
+    const RailSample& start = samples[i];
+    const RailSample& finish = samples[i + 1];
+    // Extraction restarts the sample index for every keyframe. Never bridge
+    // two independent extraction windows, even if they spatially overlap.
+    if (start.segment != finish.segment || finish.index != start.index + 1) continue;
+    const V3 center_start = 0.5 * (start.left + start.right);
+    const V3 center_finish = 0.5 * (finish.left + finish.right);
+    const V3 delta = center_finish - center_start;
+    if (!delta.allFinite() || delta.head<2>().squaredNorm() < 1.0e-8) continue;
+    RailSegment segment;
+    segment.start = start;
+    segment.finish = finish;
+    segment.center_start = center_start;
+    segment.center_finish = center_finish;
+    // The endpoints define the projection geometry, while the stored
+    // trajectory tangents are a less noisy direction estimate than a 0.4 m
+    // finite difference. Align their signs before averaging.
+    V3 finish_tangent = finish.tangent;
+    if (start.tangent.dot(finish_tangent) < 0.0) finish_tangent = -finish_tangent;
+    const V3 averaged_tangent = start.tangent + finish_tangent;
+    segment.tangent = averaged_tangent.norm() > 1.0e-6
+        ? averaged_tangent.normalized()
+        : delta.normalized();
+    segments.push_back(std::move(segment));
+  }
+  return segments;
+}
+
+struct RailSegmentProjection {
+  double ratio = 0.0;
+  double planar_distance_sq = std::numeric_limits<double>::infinity();
+  V3 center = V3::Zero();
+  V3 left = V3::Zero();
+  V3 right = V3::Zero();
+};
+
+RailSegmentProjection projectToRailSegment(const V3& point,
+                                           const RailSegment& segment) {
+  RailSegmentProjection projection;
+  const Eigen::Vector2d delta =
+      (segment.center_finish - segment.center_start).head<2>();
+  const double length_sq = delta.squaredNorm();
+  if (length_sq < 1.0e-8) return projection;
+  projection.ratio = std::clamp(
+      (point.head<2>() - segment.center_start.head<2>()).dot(delta) / length_sq,
+      0.0, 1.0);
+  projection.center = segment.center_start +
+      projection.ratio * (segment.center_finish - segment.center_start);
+  projection.left = segment.start.left +
+      projection.ratio * (segment.finish.left - segment.start.left);
+  projection.right = segment.start.right +
+      projection.ratio * (segment.finish.right - segment.start.right);
+  projection.planar_distance_sq =
+      (point - projection.center).head<2>().squaredNorm();
+  return projection;
+}
+
 struct RailCellStat {
   int count = 0;
   double top_z = -std::numeric_limits<double>::infinity();
@@ -319,9 +393,34 @@ RailProjection projectToRailTrajectory(
     best_distance_sq = distance_sq;
     best.position = position;
     best.tangent = (finish - start).normalized();
-    best.station = cumulative[i] + ratio * std::sqrt(length_sq);
+    best.station = cumulative[i] + ratio * segment.head<2>().norm();
   }
   return best;
+}
+
+// Invert trajectory arc length directly. Vehicle orientation may oppose the
+// direction of motion, so heading-based queries cannot locate a station.
+RailProjection railTrajectoryAtStation(
+    double station, const std::vector<ExtractionFramePtr>& frames,
+    const std::vector<double>& cumulative) {
+  RailProjection result;
+  if (frames.empty()) return result;
+  result.position = frames.front()->pose.translation();
+  if (frames.size() < 2) return result;
+  station = std::clamp(station, 0.0, cumulative.back());
+  for (size_t i = 0; i + 1 < frames.size(); ++i) {
+    const double length = cumulative[i + 1] - cumulative[i];
+    if (length <= 1e-8) continue;
+    if (station > cumulative[i + 1] && i + 2 < frames.size()) continue;
+    const V3 start = frames[i]->pose.translation();
+    const V3 delta = frames[i + 1]->pose.translation() - start;
+    const double ratio = std::clamp((station - cumulative[i]) / length, 0.0, 1.0);
+    result.position = start + ratio * delta;
+    result.tangent = delta.normalized();
+    result.station = station;
+    return result;
+  }
+  return result;
 }
 
 std::vector<RailSample> extractRailVector(
@@ -455,10 +554,8 @@ std::vector<RailSample> extractRailVector(
 
     const double station =
         (static_cast<double>(station_bin) + 0.5) * config.rail_station_resolution;
-    const V3 query = task.frames.front()->pose.translation() +
-        station * task.frames.front()->pose.rotation().col(0);
     const RailProjection projection =
-        projectToRailTrajectory(query, task.frames, cumulative);
+        railTrajectoryAtStation(station, task.frames, cumulative);
     Eigen::Vector2d tangent_xy = projection.tangent.head<2>();
     if (tangent_xy.norm() < 1.0e-6) continue;
     tangent_xy.normalize();
@@ -478,6 +575,79 @@ std::vector<RailSample> extractRailVector(
     output.push_back(sample);
   }
   if (output.size() < config.rail_min_segment_samples) output.clear();
+  return output;
+}
+
+// Select measured points from the full-resolution scans around detected rails.
+// Segment interpolation only defines the selection corridor; output coordinates
+// always come from the input scans, without voxel filtering or synthetic points.
+PoleCloud extractRailPoints(const ExtractionTask& task,
+                            const std::vector<RailSample>& rails,
+                            const PoleExtractionConfig& config) {
+  struct Corridor { V3 start; V3 finish; };
+  std::vector<Corridor> corridors;
+  for (size_t i = 0; i < rails.size(); ++i) {
+    const RailSample& sample = rails[i];
+    V3 tangent(sample.tangent.x(), sample.tangent.y(), 0.0);
+    if (tangent.norm() < 1e-6) continue;
+    tangent.normalize();
+    for (bool left : {true, false}) {
+      const V3& center = left ? sample.left : sample.right;
+      const V3 half = 0.5 * config.rail_station_resolution * tangent;
+      corridors.push_back({center - half, center + half});
+      if (i == 0) continue;
+      const RailSample& previous = rails[i - 1];
+      const double gap = sample.station - previous.station;
+      if (previous.segment != sample.segment || gap <= 0.0 ||
+          gap > 3.0 * config.rail_station_resolution) continue;
+      const V3& start = left ? previous.left : previous.right;
+      if ((center - start).head<2>().norm() > gap + config.rail_max_lateral_jump ||
+          std::abs(center.z() - start.z()) > 3.0 * config.rail_max_vertical_jump) continue;
+      corridors.push_back({start, center});
+    }
+  }
+
+  // Spatial buckets avoid comparing every raw point to every rail segment.
+  std::unordered_map<Cell, std::vector<size_t>, CellHash> buckets;
+  const double width = config.rail_cloud_half_width;
+  for (size_t i = 0; i < corridors.size(); ++i) {
+    const auto& c = corridors[i];
+    const int xmin = static_cast<int>(std::floor(std::min(c.start.x(), c.finish.x()) - width));
+    const int xmax = static_cast<int>(std::floor(std::max(c.start.x(), c.finish.x()) + width));
+    const int ymin = static_cast<int>(std::floor(std::min(c.start.y(), c.finish.y()) - width));
+    const int ymax = static_cast<int>(std::floor(std::max(c.start.y(), c.finish.y()) + width));
+    for (int x = xmin; x <= xmax; ++x) {
+      for (int y = ymin; y <= ymax; ++y) buckets[{x, y}].push_back(i);
+    }
+  }
+  PoleCloud output;
+  if (corridors.empty()) return output;
+  for (const auto& frame : task.frames) {
+    for (size_t i = 0; i < frame->cloud.size(); ++i) {
+      const V3 local = frame->cloud[i];
+      if (!local.allFinite()) continue;
+      const V3 world = frame->pose * local;
+      const Cell cell{static_cast<int>(std::floor(world.x())),
+                      static_cast<int>(std::floor(world.y()))};
+      const auto found = buckets.find(cell);
+      if (found == buckets.end()) continue;
+      for (size_t index : found->second) {
+        const Corridor& c = corridors[index];
+        const V3 delta = c.finish - c.start;
+        const double length_sq = delta.head<2>().squaredNorm();
+        const double ratio = length_sq > 1e-12 ? std::clamp(
+            (world - c.start).head<2>().dot(delta.head<2>()) / length_sq, 0.0, 1.0) : 0.0;
+        const V3 projected = c.start + ratio * delta;
+        const double dz = world.z() - projected.z();
+        if ((world - projected).head<2>().squaredNorm() <= width * width &&
+            dz >= -config.rail_cloud_depth && dz <= config.rail_cloud_above) {
+          output.push_back({static_cast<float>(world.x()), static_cast<float>(world.y()),
+                            static_cast<float>(world.z())});
+          break;
+        }
+      }
+    }
+  }
   return output;
 }
 
@@ -1455,16 +1625,25 @@ bool loadPositive(const config_internal::MergedYaml& yaml, const char* key, cons
 bool loadPoleExtractionConfig(const std::vector<std::string>& yaml_paths,
                               PoleExtractionConfig& config) {
   config_internal::MergedYaml yaml;
+  YAML::Node snapshot;
   for (const std::string& path : yaml_paths) {
     if (path.empty()) continue;
     try {
-      yaml.add(YAML::LoadFile(path));
+      const YAML::Node root = YAML::LoadFile(path);
+      yaml.add(root);
+      for (const char* section : {"pole_extraction", "rail_extraction"}) {
+        if (!root[section]) continue;
+        for (const auto& entry : root[section]) {
+          snapshot[section][entry.first.as<std::string>()] = YAML::Clone(entry.second);
+        }
+      }
     } catch (const std::exception& error) {
       LOG(E, "Failed to load pole extraction config from '" << path << "': " << error.what());
       return false;
     }
   }
 
+  config.extraction_config_yaml = YAML::Dump(snapshot);
   config.enable = yaml.get<bool>("pole_extraction", "enable", config.enable);
   config.process_partial_keyframe = yaml.get<bool>(
       "pole_extraction", "process_partial_keyframe", config.process_partial_keyframe);
@@ -1691,6 +1870,12 @@ bool loadPoleExtractionConfig(const std::vector<std::string>& yaml_paths,
     const int rail_min_segment_samples = yaml.get<int>(
         "rail_extraction", "min_segment_samples",
         static_cast<int>(config.rail_min_segment_samples));
+    config.rail_cloud_half_width = yaml.get<double>(
+        "rail_extraction", "cloud_half_width_m", config.rail_cloud_half_width);
+    config.rail_cloud_depth = yaml.get<double>(
+        "rail_extraction", "cloud_depth_m", config.rail_cloud_depth);
+    config.rail_cloud_above = yaml.get<double>(
+        "rail_extraction", "cloud_above_m", config.rail_cloud_above);
     config.rail_map_path = yaml.get<std::string>(
         "rail_extraction", "map_path", config.rail_map_path);
     config.rail_match_distance = yaml.get<double>(
@@ -1706,6 +1891,13 @@ bool loadPoleExtractionConfig(const std::vector<std::string>& yaml_paths,
         "rail_extraction", "huber_delta_m", config.rail_huber_delta);
     config.rail_max_rms = yaml.get<double>(
         "rail_extraction", "max_rms_m", config.rail_max_rms);
+    config.rail_max_planar_rms = yaml.get<double>(
+        "rail_extraction", "max_planar_rms_m", config.rail_max_planar_rms);
+    config.rail_max_cross_track_step = yaml.get<double>(
+        "rail_extraction", "max_cross_track_step_m",
+        config.rail_max_cross_track_step);
+    config.rail_max_yaw_step_deg = yaml.get<double>(
+        "rail_extraction", "max_yaw_step_deg", config.rail_max_yaw_step_deg);
     config.rail_max_z_step = yaml.get<double>(
         "rail_extraction", "max_z_step_m", config.rail_max_z_step);
     config.rail_max_tilt_step_deg = yaml.get<double>(
@@ -1714,7 +1906,10 @@ bool loadPoleExtractionConfig(const std::vector<std::string>& yaml_paths,
         "rail_extraction", "update_roll", config.rail_update_roll);
     config.rail_update_pitch = yaml.get<bool>(
         "rail_extraction", "update_pitch", config.rail_update_pitch);
-    if (config.rail_station_resolution <= 0.0 ||
+    if (!std::isfinite(config.rail_cloud_half_width) || config.rail_cloud_half_width <= 0.0 ||
+        !std::isfinite(config.rail_cloud_depth) || config.rail_cloud_depth <= 0.0 ||
+        !std::isfinite(config.rail_cloud_above) || config.rail_cloud_above <= 0.0 ||
+        config.rail_station_resolution <= 0.0 ||
         config.rail_lateral_resolution <= 0.0 ||
         config.rail_lateral_min >= config.rail_lateral_max ||
         config.rail_relative_z_min >= config.rail_relative_z_max ||
@@ -1726,7 +1921,9 @@ bool loadPoleExtractionConfig(const std::vector<std::string>& yaml_paths,
         config.rail_max_vertical_jump <= 0.0 || config.rail_max_cross_level <= 0.0 ||
         config.rail_match_distance <= 0.0 ||
         config.rail_min_baseline <= 0.0 || config.rail_huber_delta <= 0.0 ||
-        config.rail_max_rms <= 0.0 || config.rail_max_z_step <= 0.0 ||
+        config.rail_max_rms <= 0.0 || config.rail_max_planar_rms <= 0.0 ||
+        config.rail_max_cross_track_step <= 0.0 ||
+        config.rail_max_yaw_step_deg <= 0.0 || config.rail_max_z_step <= 0.0 ||
         config.rail_max_tilt_step_deg <= 0.0) {
       LOG(E, "Config error: invalid rail_extraction parameter.");
       return false;
@@ -1800,24 +1997,28 @@ bool loadPoleExtractionConfig(const std::vector<std::string>& yaml_paths,
 
 class PoleExtractor::Impl {
  public:
-  Impl(ros::NodeHandle& nh, const std::shared_ptr<Pipeline>& pipeline,
-       PoleExtractionConfig config, const std::string& topic_prefix)
-      : config_(std::move(config)), map_frame_(pipeline->config().map_frame) {
-    centers_pub_ =
-        nh.advertise<sensor_msgs::PointCloud2>(topic_prefix + "/poles/centers", 2, true);
-    points_pub_ =
-        nh.advertise<sensor_msgs::PointCloud2>(topic_prefix + "/poles/points", 2, true);
-    map_pub_ = nh.advertise<sensor_msgs::PointCloud2>(topic_prefix + "/poles/map", 1, true);
-    prior_map_pub_ =
-        nh.advertise<sensor_msgs::PointCloud2>(topic_prefix + "/poles/prior_map", 1, true);
-    correction_pub_ =
-        nh.advertise<nav_msgs::Odometry>(topic_prefix + "/poles/correction", 1, true);
-    markers_pub_ = nh.advertise<visualization_msgs::MarkerArray>(
-        topic_prefix + "/poles/markers", 1, true);
-    rail_points_pub_ = nh.advertise<sensor_msgs::PointCloud2>(
-        topic_prefix + "/rails/observed", 2, true);
-    rail_map_pub_ = nh.advertise<sensor_msgs::PointCloud2>(
-        topic_prefix + "/rails/map", 1, true);
+  Impl(ros::NodeHandle* nh, const std::shared_ptr<Pipeline>& pipeline,
+       PoleExtractionConfig config, const std::string& topic_prefix,
+       const std::string& map_frame = "map")
+      : config_(std::move(config)), map_frame_(pipeline ? pipeline->config().map_frame : map_frame),
+        offline_(!nh) {
+    if (nh) {
+      centers_pub_ =
+          nh->advertise<sensor_msgs::PointCloud2>(topic_prefix + "/poles/centers", 2, true);
+      points_pub_ =
+          nh->advertise<sensor_msgs::PointCloud2>(topic_prefix + "/poles/points", 2, true);
+      map_pub_ = nh->advertise<sensor_msgs::PointCloud2>(topic_prefix + "/poles/map", 1, true);
+      prior_map_pub_ =
+          nh->advertise<sensor_msgs::PointCloud2>(topic_prefix + "/poles/prior_map", 1, true);
+      correction_pub_ =
+          nh->advertise<nav_msgs::Odometry>(topic_prefix + "/poles/correction", 1, true);
+      markers_pub_ = nh->advertise<visualization_msgs::MarkerArray>(
+          topic_prefix + "/poles/markers", 1, true);
+      rail_points_pub_ = nh->advertise<sensor_msgs::PointCloud2>(
+          topic_prefix + "/rails/observed", 2, true);
+      rail_map_pub_ = nh->advertise<sensor_msgs::PointCloud2>(
+          topic_prefix + "/rails/map", 1, true);
+    }
     if (config_.localization_enable) {
       std::string message;
       localization_ready_ =
@@ -1840,7 +2041,15 @@ class PoleExtractor::Impl {
         rail_localization_ready_ =
             loadRailMap(config_.rail_map_path, prior_rails_, &rail_message);
         if (rail_localization_ready_) {
-          LOG(I, rail_message);
+          prior_rail_segments_ = buildRailSegments(prior_rails_);
+          rail_localization_ready_ = !prior_rail_segments_.empty();
+          if (rail_localization_ready_) {
+            LOG(I, rail_message << " Built " << prior_rail_segments_.size()
+                                << " continuous rail segments.");
+          } else {
+            LOG(E, "Rail vector map contains no adjacent samples that can form segments: '"
+                       << config_.rail_map_path << "'.");
+          }
         } else {
           LOG(E, rail_message);
         }
@@ -1857,7 +2066,7 @@ class PoleExtractor::Impl {
       }
     }
     worker_ = std::thread(&Impl::workerLoop, this);
-    pipeline->addFrameObserver(
+    if (pipeline) pipeline->addFrameObserver(
         [this](uint64_t stamp, const Transform& pose, const Pointcloud& cloud) {
           addFrame(stamp, pose, cloud);
         });
@@ -1882,7 +2091,7 @@ class PoleExtractor::Impl {
     frame->pose = extraction_pose;
     frame->cloud = cloud;
 
-    std::lock_guard<std::mutex> lock(queue_mutex_);
+    std::unique_lock<std::mutex> lock(queue_mutex_);
     if (!accepting_.load(std::memory_order_relaxed)) return;
     ++received_frames_;
     if (has_last_frame_position_) {
@@ -1903,6 +2112,10 @@ class PoleExtractor::Impl {
         current_frames_.size() >= config_.min_frames_per_keyframe &&
         distance_since_keyframe_ >= config_.keyframe_distance;
     if (!reached_frame_limit && !reached_distance) return;
+    if (offline_) {
+      queue_cv_.wait(lock, [this] { return queue_.size() < config_.max_queue || stop_; });
+      if (stop_) return;
+    }
     queueCurrentKeyframeLocked();
     queue_cv_.notify_one();
   }
@@ -1954,6 +2167,11 @@ class PoleExtractor::Impl {
     correction_observer_ = std::move(observer);
   }
 
+  void setKeyframeObserver(PoleExtractor::KeyframeObserver observer) {
+    std::lock_guard<std::mutex> lock(callback_mutex_);
+    keyframe_observer_ = std::move(observer);
+  }
+
   PoleLocalizationCorrection localizationCorrection() const {
     std::lock_guard<std::mutex> lock(correction_mutex_);
     return localization_correction_;
@@ -1970,12 +2188,16 @@ class PoleExtractor::Impl {
 
   bool saveResults(std::string* message) const {
     namespace fs = std::filesystem;
+    PoleCloud pole_points;
+    PoleCloud rail_points;
     std::vector<Detection> detections;
     std::vector<Landmark> landmarks;
     std::vector<RailSample> rails;
     std::vector<PoleLocalizationCorrection> corrections;
     {
       std::lock_guard<std::mutex> lock(results_mutex_);
+      pole_points = pole_points_;
+      rail_points = rail_points_;
       detections = detections_;
       landmarks = landmarks_;
       rails = rail_samples_;
@@ -2000,6 +2222,23 @@ class PoleExtractor::Impl {
               [](const Landmark& lhs, const Landmark& rhs) { return lhs.id < rhs.id; });
 
     const fs::path directory(config_.output_directory);
+    if (!config_.extraction_config_yaml.empty()) {
+      YAML::Node snapshot = YAML::Load(config_.extraction_config_yaml);
+      snapshot["pole_extraction"]["enable"] = config_.enable;
+      snapshot["pole_extraction"]["localization_enable"] = config_.localization_enable;
+      snapshot["pole_extraction"]["mapping_trajectory_path"] = config_.mapping_trajectory_path;
+      snapshot["pole_extraction"]["output_directory"] = config_.output_directory;
+      snapshot["pole_extraction"]["save_keyframe_clouds"] = config_.save_keyframe_clouds;
+      snapshot["rail_extraction"]["enable"] = config_.rail_enable;
+      std::ofstream snapshot_file(directory / "extraction_config.yaml");
+      snapshot_file << snapshot << "\n";
+      snapshot_file.close();
+      if (!snapshot_file) {
+        if (message) *message = "Failed to save extraction configuration.";
+        return false;
+      }
+    }
+
     std::ofstream landmark_file(directory / "landmarks.txt");
     std::ofstream detection_file(directory / "detections.txt");
     std::ofstream summary_file(directory / "summary.yaml");
@@ -2065,7 +2304,8 @@ class PoleExtractor::Impl {
     if (config_.localization_enable) {
       correction_file
           << "Timestamp Type OdomDistance X Y Z QX QY QZ QW Matches MatchRatio "
-             "Baseline RMS\n"
+             "Baseline RMS PlanarRMS RailTangentX RailTangentY "
+             "CrossTrackEnabled YawEnabled\n"
           << std::fixed << std::setprecision(9);
       for (const PoleLocalizationCorrection& correction : corrections) {
         const V3& translation = correction.T_map_odom.translation();
@@ -2078,7 +2318,12 @@ class PoleExtractor::Impl {
                         << quaternion.x() << " " << quaternion.y() << " "
                         << quaternion.z() << " " << quaternion.w() << " "
                         << correction.matches << " " << correction.match_ratio << " "
-                        << correction.baseline << " " << correction.rms << "\n";
+                        << correction.baseline << " " << correction.rms << " "
+                        << correction.planar_rms << " "
+                        << correction.rail_tangent_map.x() << " "
+                        << correction.rail_tangent_map.y() << " "
+                        << (correction.constrain_cross_track ? 1 : 0) << " "
+                        << (correction.constrain_yaw ? 1 : 0) << "\n";
       }
     }
 
@@ -2101,6 +2346,16 @@ class PoleExtractor::Impl {
         (config_.rail_enable && !rail_file) ||
         (config_.localization_enable && !correction_file)) {
       if (message) *message = "Failed while writing pole text results.";
+      return false;
+    }
+
+    if (config_.save_keyframe_clouds &&
+        !writeXYZPcd(directory / "poles.pcd", pole_points)) {
+      if (message) *message = "Failed to save accumulated pole point cloud.";
+      return false;
+    }
+    if (config_.rail_enable && !writeXYZPcd(directory / "rails.pcd", rail_points)) {
+      if (message) *message = "Failed to save accumulated rail point cloud.";
       return false;
     }
 
@@ -2373,6 +2628,7 @@ class PoleExtractor::Impl {
     correction.T_map_odom = current;
     correction.stamp = stamp;
     correction.odom_distance_m = odom_distance_m;
+    correction.correction_anchor_odom = centre;
     correction.matches = matches.size();
     correction.match_ratio = match_ratio;
     correction.baseline = baseline;
@@ -2383,9 +2639,24 @@ class PoleExtractor::Impl {
 
   struct RailMatch {
     size_t local = 0;
-    size_t prior = 0;
+    size_t prior_segment = 0;
+    double projection_ratio = 0.0;
     bool swap_sides = false;
   };
+
+  RailSegmentProjection railTarget(const RailMatch& match) const {
+    const RailSegment& segment = prior_rail_segments_[match.prior_segment];
+    RailSegmentProjection target;
+    target.ratio = match.projection_ratio;
+    target.center = segment.center_start + target.ratio *
+        (segment.center_finish - segment.center_start);
+    target.left = segment.start.left + target.ratio *
+        (segment.finish.left - segment.start.left);
+    target.right = segment.start.right + target.ratio *
+        (segment.finish.right - segment.start.right);
+    target.planar_distance_sq = 0.0;
+    return target;
+  }
 
   std::vector<RailMatch> associateRails(const std::vector<RailSample>& local,
                                         const Transform& correction) const {
@@ -2395,34 +2666,37 @@ class PoleExtractor::Impl {
     const double distance_sq_gate =
         config_.rail_match_distance * config_.rail_match_distance;
     std::vector<RailMatch> matches;
-    std::unordered_set<size_t> used;
+    std::unordered_set<size_t> used_segments;
     for (size_t i = 0; i < local.size(); ++i) {
       const V3 local_center = 0.5 * (local[i].left + local[i].right);
       const V3 moved_center = correction * local_center;
       const V3 moved_tangent = correction.rotation() * local[i].tangent;
-      size_t best = prior_rails_.size();
+      size_t best = prior_rail_segments_.size();
       double best_distance_sq = distance_sq_gate;
-      for (size_t j = 0; j < prior_rails_.size(); ++j) {
-        if (used.find(j) != used.end()) continue;
-        const V3 prior_center = 0.5 * (prior_rails_[j].left + prior_rails_[j].right);
-        const double distance_sq =
-            (moved_center - prior_center).head<2>().squaredNorm();
+      RailSegmentProjection best_projection;
+      for (size_t j = 0; j < prior_rail_segments_.size(); ++j) {
+        if (used_segments.find(j) != used_segments.end()) continue;
+        const RailSegment& segment = prior_rail_segments_[j];
+        const RailSegmentProjection projection =
+            projectToRailSegment(moved_center, segment);
         const double tangent_dot = std::abs(
-            moved_tangent.normalized().dot(prior_rails_[j].tangent.normalized()));
-        if (distance_sq <= best_distance_sq && tangent_dot >= tangent_dot_gate) {
+            moved_tangent.normalized().dot(segment.tangent));
+        if (projection.planar_distance_sq <= best_distance_sq &&
+            tangent_dot >= tangent_dot_gate) {
           best = j;
-          best_distance_sq = distance_sq;
+          best_distance_sq = projection.planar_distance_sq;
+          best_projection = projection;
         }
       }
-      if (best == prior_rails_.size()) continue;
+      if (best == prior_rail_segments_.size()) continue;
       const double direct =
-          ((correction * local[i].left) - prior_rails_[best].left).head<2>().squaredNorm() +
-          ((correction * local[i].right) - prior_rails_[best].right).head<2>().squaredNorm();
+          ((correction * local[i].left) - best_projection.left).head<2>().squaredNorm() +
+          ((correction * local[i].right) - best_projection.right).head<2>().squaredNorm();
       const double swapped =
-          ((correction * local[i].left) - prior_rails_[best].right).head<2>().squaredNorm() +
-          ((correction * local[i].right) - prior_rails_[best].left).head<2>().squaredNorm();
-      matches.push_back({i, best, swapped < direct});
-      used.insert(best);
+          ((correction * local[i].left) - best_projection.right).head<2>().squaredNorm() +
+          ((correction * local[i].right) - best_projection.left).head<2>().squaredNorm();
+      matches.push_back({i, best, best_projection.ratio, swapped < direct});
+      used_segments.insert(best);
     }
     return matches;
   }
@@ -2436,7 +2710,29 @@ class PoleExtractor::Impl {
     ++rail_localization_attempts_;
     Transform current = *seed;
     std::vector<RailMatch> matches;
-    for (int iteration = 0; iteration < 5; ++iteration) {
+    // A rigid initial map seed cannot represent accumulated LIO height drift.
+    // At the first rail-covered keyframe the vertical discrepancy can already
+    // be large, so give bootstrap enough range to converge.  Tracking remains
+    // deliberately conservative after the first accepted rail correction.
+    const int max_iterations = 30;
+    const double max_z_iteration = 5.0;
+    auto referenceTangent = [this](
+        const std::vector<RailMatch>& rail_matches) -> Eigen::Vector2d {
+      Eigen::Vector2d reference = Eigen::Vector2d::Zero();
+      for (const RailMatch& match : rail_matches) {
+        Eigen::Vector2d tangent =
+            prior_rail_segments_[match.prior_segment].tangent.head<2>();
+        if (tangent.norm() < 1.0e-8) continue;
+        tangent.normalize();
+        if (reference.squaredNorm() > 1.0e-8 && reference.dot(tangent) < 0.0) {
+          tangent = -tangent;
+        }
+        reference += tangent;
+      }
+      if (reference.norm() < 1.0e-8) return Eigen::Vector2d(1.0, 0.0);
+      return reference.normalized();
+    };
+    for (int iteration = 0; iteration < max_iterations; ++iteration) {
       matches = associateRails(local, current);
       if (matches.size() < config_.rail_min_matches) return std::nullopt;
       V3 anchor = V3::Zero();
@@ -2445,58 +2741,115 @@ class PoleExtractor::Impl {
                                     local[match.local].right));
       }
       anchor /= static_cast<double>(matches.size());
-      Eigen::Matrix3d normal = Eigen::Matrix3d::Zero();
-      Eigen::Vector3d rhs = Eigen::Vector3d::Zero();
+      const Eigen::Vector2d tangent_reference = referenceTangent(matches);
+      const Eigen::Vector2d normal_reference(-tangent_reference.y(),
+                                             tangent_reference.x());
+      // [roll, pitch, yaw, cross-track translation, z]. Along-track
+      // translation is absent by construction, leaving the rail factor with
+      // exactly five observable degrees of freedom.
+      Eigen::Matrix<double, 5, 5> normal =
+          Eigen::Matrix<double, 5, 5>::Zero();
+      Eigen::Matrix<double, 5, 1> rhs =
+          Eigen::Matrix<double, 5, 1>::Zero();
       for (const RailMatch& match : matches) {
         const RailSample& observed = local[match.local];
-        const RailSample& prior = prior_rails_[match.prior];
+        const RailSegmentProjection target_projection = railTarget(match);
+        const V3 source_center = current * (0.5 * (observed.left + observed.right));
+        Eigen::Vector2d segment_tangent =
+            prior_rail_segments_[match.prior_segment].tangent.head<2>();
+        if (segment_tangent.norm() > 1.0e-8) {
+          segment_tangent.normalize();
+          if (segment_tangent.dot(tangent_reference) < 0.0) {
+            segment_tangent = -segment_tangent;
+          }
+          const Eigen::Vector2d segment_normal(-segment_tangent.y(),
+                                               segment_tangent.x());
+          const double residual = segment_normal.dot(
+              target_projection.center.head<2>() - source_center.head<2>());
+          const double robust = std::min(
+              1.0, config_.rail_huber_delta /
+                       std::max(std::abs(residual), 1.0e-6));
+          const Eigen::Vector2d lever = (source_center - anchor).head<2>();
+          Eigen::Matrix<double, 5, 1> jacobian =
+              Eigen::Matrix<double, 5, 1>::Zero();
+          jacobian(2) = segment_normal.dot(Eigen::Vector2d(-lever.y(), lever.x()));
+          jacobian(3) = segment_normal.dot(normal_reference);
+          normal.noalias() += robust * jacobian * jacobian.transpose();
+          rhs.noalias() += robust * jacobian * residual;
+        }
         for (int side = 0; side < 2; ++side) {
           const V3 source = current * (side == 0 ? observed.left : observed.right);
           const bool target_left = (side == 0) != match.swap_sides;
-          const V3& target = target_left ? prior.left : prior.right;
+          const V3& target = target_left ? target_projection.left
+                                         : target_projection.right;
           const double residual = target.z() - source.z();
           const double robust = std::min(
               1.0, config_.rail_huber_delta / std::max(std::abs(residual), 1.0e-6));
-          const Eigen::Vector3d jacobian(source.y() - anchor.y(),
-                                         -(source.x() - anchor.x()), 1.0);
+          Eigen::Matrix<double, 5, 1> jacobian =
+              Eigen::Matrix<double, 5, 1>::Zero();
+          jacobian(0) = source.y() - anchor.y();
+          jacobian(1) = -(source.x() - anchor.x());
+          jacobian(4) = 1.0;
           normal.noalias() += robust * jacobian * jacobian.transpose();
           rhs.noalias() += robust * jacobian * residual;
         }
       }
-      const Eigen::LDLT<Eigen::Matrix3d> decomposition(normal);
+      const Eigen::LDLT<Eigen::Matrix<double, 5, 5>> decomposition(normal);
       if (decomposition.info() != Eigen::Success) return std::nullopt;
-      Eigen::Vector3d delta = decomposition.solve(rhs);
+      Eigen::Matrix<double, 5, 1> delta = decomposition.solve(rhs);
       if (!delta.allFinite()) return std::nullopt;
-      delta.x() = std::clamp(delta.x(), -0.01, 0.01);
-      delta.y() = std::clamp(delta.y(), -0.01, 0.01);
-      delta.z() = std::clamp(delta.z(), -0.20, 0.20);
+      delta(0) = std::clamp(delta(0), -0.01, 0.01);
+      delta(1) = std::clamp(delta(1), -0.01, 0.01);
+      delta(2) = std::clamp(delta(2), -0.01, 0.01);
+      delta(3) = std::clamp(delta(3), -0.50, 0.50);
+      delta(4) = std::clamp(delta(4), -max_z_iteration, max_z_iteration);
       const Rotation delta_rotation =
-          (Eigen::AngleAxisd(delta.y(), V3::UnitY()) *
-           Eigen::AngleAxisd(delta.x(), V3::UnitX())).toRotationMatrix();
+          (Eigen::AngleAxisd(delta(2), V3::UnitZ()) *
+           Eigen::AngleAxisd(delta(1), V3::UnitY()) *
+           Eigen::AngleAxisd(delta(0), V3::UnitX())).toRotationMatrix();
       Transform left_update = Transform::Identity();
       left_update.linear() = delta_rotation;
       left_update.translation() = anchor - delta_rotation * anchor +
-                                  V3(0.0, 0.0, delta.z());
+          V3(delta(3) * normal_reference.x(),
+             delta(3) * normal_reference.y(), delta(4));
       current = Transform(Eigen::Isometry3d(left_update * current));
-      if (delta.head<2>().norm() < 1.0e-6 && std::abs(delta.z()) < 1.0e-5) break;
+      if (delta.head<4>().norm() < 1.0e-6 && std::abs(delta(4)) < 1.0e-5) break;
     }
 
     matches = associateRails(local, current);
     if (matches.size() < config_.rail_min_matches) return std::nullopt;
     double squared_error = 0.0;
+    double planar_squared_error = 0.0;
     double baseline = 0.0;
     V3 first_center = V3::Zero();
+    V3 correction_anchor = V3::Zero();
     bool have_first = false;
+    const Eigen::Vector2d tangent_reference = referenceTangent(matches);
+    const Eigen::Vector2d normal_reference(-tangent_reference.y(),
+                                           tangent_reference.x());
     for (const RailMatch& match : matches) {
       const RailSample& observed = local[match.local];
-      const RailSample& prior = prior_rails_[match.prior];
+      const RailSegmentProjection target_projection = railTarget(match);
       const V3 source_left = current * observed.left;
       const V3 source_right = current * observed.right;
-      const V3& target_left = match.swap_sides ? prior.right : prior.left;
-      const V3& target_right = match.swap_sides ? prior.left : prior.right;
+      const V3& target_left = match.swap_sides ? target_projection.right
+                                               : target_projection.left;
+      const V3& target_right = match.swap_sides ? target_projection.left
+                                                : target_projection.right;
       squared_error += std::pow(source_left.z() - target_left.z(), 2) +
                        std::pow(source_right.z() - target_right.z(), 2);
+      Eigen::Vector2d segment_tangent =
+          prior_rail_segments_[match.prior_segment].tangent.head<2>();
+      if (segment_tangent.norm() > 1.0e-8) {
+        segment_tangent.normalize();
+        const Eigen::Vector2d segment_normal(-segment_tangent.y(),
+                                             segment_tangent.x());
+        const V3 source_center = 0.5 * (source_left + source_right);
+        planar_squared_error += std::pow(segment_normal.dot(
+            source_center.head<2>() - target_projection.center.head<2>()), 2);
+      }
       const V3 center = 0.5 * (observed.left + observed.right);
+      correction_anchor += center;
       if (!have_first) {
         first_center = center;
         have_first = true;
@@ -2505,30 +2858,61 @@ class PoleExtractor::Impl {
     }
     const double rms = std::sqrt(
         squared_error / static_cast<double>(2 * matches.size()));
-    const double z_step = std::abs(current.translation().z() - seed->translation().z());
+    const double planar_rms = std::sqrt(
+        planar_squared_error / static_cast<double>(matches.size()));
+    correction_anchor /= static_cast<double>(matches.size());
+    const double z_step = std::abs((current * correction_anchor).z() -
+                                   (*seed * correction_anchor).z());
     const Rotation rotation_step = current.rotation() * seed->rotation().transpose();
     const double tilt_step = Eigen::AngleAxisd(rotation_step).angle() *
                              180.0 / 3.14159265358979323846;
+    // The Kalman layer applies the tight tracking innovation gates and knows
+    // how far it has travelled since the last accepted rail fix.  Here retain
+    // only a broad 10-degree sanity bound so a valid fit can be handed over for
+    // re-acquisition after a long rail-coverage gap.
+    const double broad_tilt_gate =
+        std::max(10.0, config_.rail_max_tilt_step_deg);
     if (baseline < config_.rail_min_baseline || rms > config_.rail_max_rms ||
-        z_step > config_.rail_max_z_step ||
-        tilt_step > config_.rail_max_tilt_step_deg) {
+        tilt_step > broad_tilt_gate) {
       LOG(W, "Rejected rail correction: " << matches.size() << " matches, baseline "
                                              << baseline << " m, vertical RMS " << rms
                                              << " m, step " << z_step << " m / "
                                              << tilt_step << " deg.");
       return std::nullopt;
     }
+    const V3 seed_anchor_map = *seed * correction_anchor;
+    const V3 fitted_anchor_map = current * correction_anchor;
+    const double cross_track_step = std::abs(normal_reference.dot(
+        (fitted_anchor_map - seed_anchor_map).head<2>()));
+    const double yaw_step = std::abs(wrappedAngle(
+        yawOf(current.rotation()) - yawOf(seed->rotation()))) *
+        180.0 / 3.14159265358979323846;
+    const bool planar_valid =
+        planar_rms <= config_.rail_max_planar_rms &&
+        cross_track_step <= config_.rail_max_cross_track_step &&
+        yaw_step <= config_.rail_max_yaw_step_deg;
+    if (!planar_valid) {
+      LOG(W, "Rail vertical fit accepted without planar constraints: RMS "
+                 << planar_rms << " m, cross-track/yaw step "
+                 << cross_track_step << " m / " << yaw_step << " deg.");
+    }
     PoleLocalizationCorrection correction;
     correction.T_map_odom = current;
     correction.stamp = stamp;
     correction.odom_distance_m = odom_distance_m;
+    correction.correction_anchor_odom = correction_anchor;
     correction.matches = matches.size();
     correction.match_ratio = static_cast<double>(matches.size()) /
                              static_cast<double>(local.size());
     correction.baseline = baseline;
     correction.rms = rms;
+    correction.planar_rms = planar_rms;
+    correction.rail_tangent_map =
+        V3(tangent_reference.x(), tangent_reference.y(), 0.0);
     correction.constrain_planar = false;
     correction.constrain_vertical = true;
+    correction.constrain_cross_track = planar_valid;
+    correction.constrain_yaw = planar_valid;
     correction.constrain_z = true;
     correction.constrain_roll = config_.rail_update_roll;
     correction.constrain_pitch = config_.rail_update_pitch;
@@ -2539,7 +2923,32 @@ class PoleExtractor::Impl {
   void acceptRailCorrection(const PoleLocalizationCorrection& correction) {
     {
       std::lock_guard<std::mutex> lock(correction_mutex_);
+      // Keep the extractor's pole-association seed free of rail-planar
+      // ambiguity. The full 5-DoF observation is still delivered to the
+      // localization graph below; internally we only absorb z/roll/pitch so
+      // a parallel track cannot replace the configured/pole x/y/yaw seed.
+      Transform planar_reference = correction.T_map_odom;
+      if (localization_correction_.valid) {
+        planar_reference = localization_correction_.T_map_odom;
+      } else if (configured_seed_) {
+        planar_reference = *configured_seed_;
+      }
+      const double rail_yaw = yawOf(correction.T_map_odom.rotation());
+      const double reference_yaw = yawOf(planar_reference.rotation());
+      const Rotation rail_roll_pitch =
+          yawRotation(-rail_yaw) * correction.T_map_odom.rotation();
+      const Rotation internal_rotation =
+          yawRotation(reference_yaw) * rail_roll_pitch;
+      const V3 reference_anchor =
+          planar_reference * correction.correction_anchor_odom;
+      const V3 rail_anchor =
+          correction.T_map_odom * correction.correction_anchor_odom;
+      V3 internal_anchor = reference_anchor;
+      internal_anchor.z() = rail_anchor.z();
       localization_correction_ = correction;
+      localization_correction_.T_map_odom = Transform(
+          internal_rotation,
+          internal_anchor - internal_rotation * correction.correction_anchor_odom);
       correction_history_.push_back(correction);
     }
     ++rail_localization_accepted_;
@@ -2551,7 +2960,14 @@ class PoleExtractor::Impl {
     if (observer) observer(correction);
     LOG(I, "Accepted rail correction: " << correction.matches
                                           << " paired samples, vertical RMS "
-                                          << correction.rms << " m.");
+                                          << correction.rms << " m, planar RMS "
+                                          << correction.planar_rms
+                                          << " m, planar constraints "
+                                          << (correction.constrain_cross_track &&
+                                                      correction.constrain_yaw
+                                                  ? "enabled"
+                                                  : "disabled")
+                                          << ".");
   }
 
   void processRails(uint64_t stamp, double odom_distance_m,
@@ -2638,7 +3054,7 @@ class PoleExtractor::Impl {
     }
     distance_since_keyframe_ = 0.0;
     new_frames_since_keyframe_ = 0;
-    if (queue_.size() >= config_.max_queue) {
+    if (!offline_ && queue_.size() >= config_.max_queue) {
       queue_.pop_front();
       ++dropped_keyframes_;
     }
@@ -2655,21 +3071,35 @@ class PoleExtractor::Impl {
         task = std::move(queue_.front());
         queue_.pop_front();
       }
+      queue_cv_.notify_all();
 
       const auto start = std::chrono::steady_clock::now();
       const auto guided_poles = guidedRoiPoles(task);
       ExtractionResult result = extract(task, config_, guided_poles);
       const std::vector<RailSample> rails =
           extractRailVector(task, result.downsampled, config_);
+      PoleCloud rail_cloud = extractRailPoints(task, rails, config_);
       integrateDetections(result.detections);
-      localizePoles(task.frames.back()->stamp, task.frames.back()->odom_distance_m,
+      const auto& anchor_frame = task.frames.back();
+      PoleExtractor::KeyframeObserver keyframe_observer;
+      {
+        std::lock_guard<std::mutex> lock(callback_mutex_);
+        keyframe_observer = keyframe_observer_;
+      }
+      // Register X(k) before either observation callback can add a factor for
+      // this timestamp.
+      if (keyframe_observer) {
+        keyframe_observer(anchor_frame->stamp, anchor_frame->pose,
+                          anchor_frame->odom_distance_m);
+      }
+      localizePoles(anchor_frame->stamp, anchor_frame->odom_distance_m,
                     result.detections);
-      processRails(task.frames.back()->stamp, task.frames.back()->odom_distance_m, rails);
-      publish(task.frames.back()->stamp, result);
-      publishCloud(railsToCloud(rails), task.frames.back()->stamp, rail_points_pub_);
+      processRails(anchor_frame->stamp, anchor_frame->odom_distance_m, rails);
+      publish(anchor_frame->stamp, result);
+      publishCloud(railsToCloud(rails), anchor_frame->stamp, rail_points_pub_);
       if (config_.localization_enable && config_.rail_enable &&
           !rail_prior_map_published_) {
-        publishCloud(railsToCloud(prior_rails_), task.frames.back()->stamp,
+        publishCloud(railsToCloud(prior_rails_), anchor_frame->stamp,
                      rail_map_pub_, config_.localization_map_frame);
         rail_prior_map_published_ = true;
       } else if (!config_.localization_enable && config_.rail_enable) {
@@ -2678,9 +3108,15 @@ class PoleExtractor::Impl {
           std::lock_guard<std::mutex> lock(results_mutex_);
           rail_snapshot = rail_samples_;
         }
-        publishCloud(railsToCloud(rail_snapshot), task.frames.back()->stamp, rail_map_pub_);
+        publishCloud(railsToCloud(rail_snapshot), anchor_frame->stamp, rail_map_pub_);
       }
-      saveKeyframeCloud(task.index, result.refined);
+      {
+        std::lock_guard<std::mutex> lock(results_mutex_);
+        if (config_.save_keyframe_clouds) {
+          pole_points_.insert(pole_points_.end(), result.refined.begin(), result.refined.end());
+        }
+        rail_points_.insert(rail_points_.end(), rail_cloud.begin(), rail_cloud.end());
+      }
       ++processed_keyframes_;
       detection_count_.fetch_add(result.detections.size());
       const double seconds =
@@ -2689,7 +3125,7 @@ class PoleExtractor::Impl {
                                << result.downsampled.size() << " ROI/downsampled points, "
                                << result.candidates.size() << " candidates, "
                                << result.detections.size() << " poles, " << rails.size()
-                               << " rail samples in " << std::fixed
+                               << " rail samples, " << rail_cloud.size() << " measured rail points in " << std::fixed
                                << std::setprecision(3) << seconds << " s.");
     }
   }
@@ -2787,6 +3223,7 @@ class PoleExtractor::Impl {
   void publishCloud(const Pointcloud& cloud, uint64_t stamp,
                     const ros::Publisher& publisher,
                     const std::string& frame = std::string()) {
+    if (!publisher) return;
     sensor_msgs::PointCloud2 message;
     pointCloudToMsg(cloud, message);
     message.header.stamp.fromNSec(stamp);
@@ -2795,6 +3232,7 @@ class PoleExtractor::Impl {
   }
 
   void publishMarkers(uint64_t stamp, const std::vector<Landmark>& landmarks) {
+    if (!markers_pub_) return;
     visualization_msgs::MarkerArray array;
     visualization_msgs::Marker clear;
     clear.header.frame_id = map_frame_;
@@ -2901,27 +3339,9 @@ class PoleExtractor::Impl {
     publishMarkers(stamp, landmarks);
   }
 
-  void saveKeyframeCloud(size_t index, const PoleCloud& cloud) const {
-    if (!config_.save_keyframe_clouds || cloud.empty() || config_.output_directory.empty()) {
-      return;
-    }
-    std::error_code error;
-    std::filesystem::create_directories(config_.output_directory, error);
-    if (error) {
-      LOG(W, "Cannot create pole keyframe output directory: " << error.message());
-      return;
-    }
-    std::ostringstream name;
-    name << "keyframe_" << std::setw(6) << std::setfill('0') << index << "_poles.pcd";
-    const std::filesystem::path path =
-        std::filesystem::path(config_.output_directory) / name.str();
-    if (!writeXYZPcd(path, cloud)) {
-      LOG(W, "Failed to save extracted pole cloud to '" << path.string() << "'.");
-    }
-  }
-
   PoleExtractionConfig config_;
   std::string map_frame_;
+  bool offline_ = false;
   ros::Publisher centers_pub_;
   ros::Publisher points_pub_;
   ros::Publisher map_pub_;
@@ -2946,6 +3366,8 @@ class PoleExtractor::Impl {
   std::thread worker_;
 
   mutable std::mutex results_mutex_;
+  PoleCloud pole_points_;
+  PoleCloud rail_points_;
   std::vector<Detection> detections_;
   std::vector<Landmark> landmarks_;
   std::vector<RailSample> rail_samples_;
@@ -2959,6 +3381,7 @@ class PoleExtractor::Impl {
   bool rail_localization_ready_ = true;
   bool rail_prior_map_published_ = false;
   std::vector<RailSample> prior_rails_;
+  std::vector<RailSegment> prior_rail_segments_;
   std::optional<Transform> configured_seed_;
   std::deque<std::vector<Detection>> recent_detection_frames_;
   mutable std::mutex correction_mutex_;
@@ -2967,6 +3390,7 @@ class PoleExtractor::Impl {
   mutable std::mutex callback_mutex_;
   PoleExtractor::CorrectionProvider correction_provider_;
   PoleExtractor::CorrectionObserver correction_observer_;
+  PoleExtractor::KeyframeObserver keyframe_observer_;
 
   std::atomic<size_t> received_frames_{0};
   std::atomic<size_t> processed_keyframes_{0};
@@ -2981,7 +3405,14 @@ class PoleExtractor::Impl {
 
 PoleExtractor::PoleExtractor(ros::NodeHandle& nh, const std::shared_ptr<Pipeline>& pipeline,
                              PoleExtractionConfig config, const std::string& topic_prefix)
-    : impl_(new Impl(nh, pipeline, std::move(config), topic_prefix)) {}
+    : impl_(new Impl(&nh, pipeline, std::move(config), topic_prefix)) {}
+
+PoleExtractor::PoleExtractor(PoleExtractionConfig config, const std::string& map_frame)
+    : impl_(new Impl(nullptr, nullptr, std::move(config), "", map_frame)) {}
+
+void PoleExtractor::addFrame(uint64_t stamp, const Transform& pose, const Pointcloud& cloud) {
+  impl_->addFrame(stamp, pose, cloud);
+}
 
 PoleExtractor::~PoleExtractor() = default;
 
@@ -2997,6 +3428,10 @@ void PoleExtractor::setCorrectionProvider(CorrectionProvider provider) {
 
 void PoleExtractor::setCorrectionObserver(CorrectionObserver observer) {
   impl_->setCorrectionObserver(std::move(observer));
+}
+
+void PoleExtractor::setKeyframeObserver(KeyframeObserver observer) {
+  impl_->setKeyframeObserver(std::move(observer));
 }
 
 PoleLocalizationCorrection PoleExtractor::localizationCorrection() const {

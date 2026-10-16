@@ -1,0 +1,635 @@
+% !TeX program = xelatex
+% UTF-8 编码。使用 XeLaTeX 连续编译两次；参考文献已内嵌，无需 BibTeX。
+% 封面个人信息待填写。正文中的“拟”表示研究计划，不表示已完成实验。
+\documentclass[UTF8,a4paper,12pt,fontset=fandol]{ctexart}
+\usepackage[left=2.6cm,right=2.6cm,top=2.6cm,bottom=2.6cm]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{booktabs,tabularx,longtable,array}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,backgrounds}
+\usepackage{setspace}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{xurl}
+\usepackage[unicode,hidelinks]{hyperref}
+\setstretch{1.42}
+\setlength{\parindent}{2em}
+\setlength{\emergencystretch}{3em}
+\setlist{nosep,leftmargin=2em}
+\renewcommand{\arraystretch}{1.25}
+\ctexset{
+  section={format=\Large\bfseries,number=\chinese{section},aftername=、},
+  subsection={format=\large\bfseries},
+  subsubsection={format=\normalsize\bfseries}
+}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{\small 硕士学位论文开题报告}
+\fancyfoot[C]{\thepage}
+\setlength{\headheight}{15pt}
+\newcommand{\ThesisTitle}{面向铁路场景的列车轻量语义地图构建与重定位方法研究}
+\newcommand{\StudentName}{待填写}
+\newcommand{\StudentID}{待填写}
+\newcommand{\SchoolName}{待填写}
+\newcommand{\MajorName}{待填写}
+\newcommand{\SupervisorName}{待填写}
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\SE}{\mathrm{SE}}
+\newcommand{\SO}{\mathrm{SO}}
+\DeclareMathOperator{\Log}{Log}
+\DeclareMathOperator{\diag}{diag}
+\hypersetup{pdftitle={\ThesisTitle},pdfauthor={硕士学位论文开题报告}}
+
+\begin{document}
+\begin{titlepage}
+  \centering
+  \vspace*{1.8cm}
+  {\zihao{1}\bfseries 硕士学位论文开题报告\par}
+  \vspace{2cm}
+  {\zihao{2}\bfseries \ThesisTitle\par}
+  \vspace{2.2cm}
+  \renewcommand{\arraystretch}{1.8}
+  \begin{tabular}{rl}
+    学生姓名： & \StudentName \\
+    学\qquad 号： & \StudentID \\
+    学院名称： & \SchoolName \\
+    学科专业： & \MajorName \\
+    指导教师： & \SupervisorName
+  \end{tabular}
+  \vfill
+  {\large \today\par}
+\end{titlepage}
+
+\begin{abstract}
+铁路列车自主定位面临线路环境结构重复、局部几何约束不足、卫星信号遮挡以及长距离运行误差累积等问题。稠密点云地图定位能够利用丰富环境信息，但全线路地图的存储、加载与匹配开销较大。为在保持定位精度的同时降低先验地图和在线计算负担，本课题拟研究面向铁路场景的列车轻量语义地图构建与重定位方法。研究内容包括：依托已有定向高度图激光惯性里程计，研究铁路非理想平面及局部起伏几何的有效利用，并结合鲁棒 GNSS 全局优化建立一致的地图坐标基准；研究面向铁路走廊的支柱与轨道几何提取、质量评估和跨关键帧融合方法，构建由支柱参数和成对轨道三维控制点组成的轻量语义地图；研究基于支柱离散地标与轨道连续结构互补约束的重定位方法，处理重复结构关联、坡道与曲线条件下的可观性及定位退化问题。课题拟采用理论分析、算法实现、实测数据对比和消融实验相结合的方法，分别评价轨迹精度、地标提取质量、重定位成功率、地图规模及计算开销，形成适用于铁路环境的轻量定位原型与可复现实验结论。
+
+\noindent\textbf{关键词：}铁路列车；激光惯性里程计；GNSS 优化；支柱与轨道提取；轻量语义地图；重定位
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{论文选题的价值与意义}
+
+\subsection{研究背景与问题提出}
+
+列车位置是铁路运行监测、线路巡检、基础设施状态感知和车载环境理解的重要基础信息。传统列车定位可以依托轨旁设备、轮轴里程计及卫星导航等信息，但不同信息源具有各自的适用条件。轮轴里程计可能受到空转、滑行及参数误差影响；GNSS 在开阔路段能够提供全局位置，在隧道、站场遮挡及多径显著区段则可能出现精度下降或中断。研究利用车载传感器感知既有铁路设施的定位方法，有助于提高复杂区段的定位连续性，并为巡检装备与列车辅助感知提供更丰富的空间信息。
+
+激光雷达能够直接获取环境三维几何，IMU 能够提供高频运动信息，二者具有较强互补性。然而，铁路环境不同于具有大量转弯、立面和不规则目标的典型城市道路。一方面，长直线路、平行钢轨和近似平整的隧道壁使观测信息集中在少数方向，沿线运动容易缺少有效约束。另一方面，接触网支柱、轨枕和其他设施沿线重复分布，局部外观相似，容易造成错误关联。铁路表面也并非严格平面，道床、轨枕、隧道衬砌及附属构件包含不同尺度的几何起伏；若用统一平面概括这些区域，可能丢失具有定位价值的细节。
+
+本课题所称“非理想平面场景”，既包括宏观近似平面中可重复观测的局部起伏，也包括坡道、曲线和轨道超高所引起的三维形态变化。前者主要影响点云配准的信息利用，后者主要影响轨道地图表达与定位约束的正确性，两者需要分别建模。细微起伏只有在超过传感器噪声、能够稳定复测且空间分布合适时才可能改善估计，不能将任意表面噪声都视为有效特征。
+
+现有稠密地图定位通常需要保存大量点云，并通过局部配准实现定位。对于长距离铁路，持续扩大稠密地图会增加存储和地图管理压力。铁路沿线的支柱和钢轨具有较明确的类别及几何结构，为压缩地图提供了条件：支柱可表示为离散轴线地标，轨道可表示为连续三维曲线或控制点序列。由此，本课题以“可靠建图、结构提取、轻量定位”为主线，研究能否以少量结构化地图要素支撑稳定的列车重定位。
+
+\subsection{理论价值}
+
+本课题的理论价值主要体现在几何表达、结构互补和不确定性处理三个方面。首先，研究局部起伏几何与位姿估计之间的关系，分析高度图分辨率、有效点选择及方向性信息对铁路退化场景的影响，为非理想平面环境中“保留哪些细节、如何利用细节”提供实验依据。其次，分析离散支柱与连续轨道对位姿的不同约束作用，区分几何信息不足引起的连续退化与重复设施引起的离散多解，研究二者互补的条件及局限。最后，研究从观测质量到地图质量、再到定位权重的传递方式，减少仅依靠固定门限和启发式权重所导致的不一致性。
+
+\subsection{应用意义}
+
+在工程应用上，课题拟将地图构建阶段对 GNSS 和完整环境信息的利用，与重复运行阶段对轻量先验地图的利用相衔接。若能够在定位阶段仅加载必要的支柱和轨道信息，将有利于降低车载地图占用、缩短地图加载时间，并减轻在线匹配负担。结构化地图同时具有较好的可解释性，便于检查错误地标、定位异常及设施变化。研究成果可为铁路巡检车辆、线路测量与车载辅助定位提供方法参考，其适用范围和可靠性仍须通过独立数据验证。
+
+\section{国内外研究现状及发展趋势}
+
+\subsection{激光惯性里程计与退化场景研究}
+
+国外激光定位研究较早形成了基于几何配准的实时建图框架。Zhang 和 Singh 提出的 LOAM 将高频里程计与低频地图优化结合，利用边缘和平面几何实现实时运动估计\cite{zhang2014loam}。Shan 等提出 LIO-SAM，将激光里程计、IMU 预积分及全局观测组织为因子图，为多源约束融合提供了通用框架\cite{shan2020liosam}。惯性预积分和增量平滑研究则为高频惯性信息处理与后端优化奠定了基础\cite{forster2017preintegration,kaess2012isam2}。
+
+国内团队在高速、直接和轻量激光惯性估计方面形成了代表性工作。香港大学团队提出 FAST-LIO2，通过迭代滤波、原始点到地图配准及增量 k-d 树提高估计效率，避免了对手工边缘特征的依赖\cite{xu2022fastlio2}。Bai 等提出 Faster-LIO，利用并行稀疏增量体素加速近邻查询，体现了地图数据结构对计算效率的重要作用\cite{bai2022fasterlio}。这些成果为车载实时实现提供了基础，但直接使用更多原始点或更快的数据结构，并不意味着能够自动消除铁路环境的方向性退化。
+
+针对约束不足问题，Zhang 等从优化系统的特征值与特征向量出发分析退化方向，在条件良好的子空间内更新状态\cite{zhang2016degeneracy}。Tuna 等提出 X-ICP，进一步研究局部可定位性及受约束配准\cite{tuna2024xicp}。Pfreundschuh 等提出 BIEVR-LIO，以体素内定向高度图表达微小表面起伏，并利用地图信息引导点采样，改善信息稀疏场景中的几何利用\cite{pfreundschuh2026bievr}。相关工作说明，除增加传感器外，合理表达和选择已有几何也可能改善定位。
+
+本课题仓库以 BIEVR-LIO 为基础。定向高度图、起伏残差及原有地图引导采样属于已有方法，本课题拟研究的是其在铁路环境中的适应性、分辨率与噪声的关系，以及能否结合方向性退化分析进行改进。高度图仍依赖局部单值表面假设，在多层表面、植被及明显遮挡边缘处需要谨慎处理。
+
+\subsection{铁路多源定位与 GNSS 全局优化研究}
+
+铁路定位研究既需要估计连续运动，也需要利用轨道约束和全局参考。德国航空航天中心的 Heirich 等提出 RailSLAM，将列车状态与轨道几何联合估计，说明线路结构可以作为状态估计的重要先验\cite{heirich2013railslam}。此类研究强调铁路运动受线路约束的特点，但不同地图表达能够提供的位姿信息并不相同，不能直接将二维线路约束推广为完整三维姿态约束。
+
+国内铁路多传感器融合研究已从单一里程推算发展到面向复杂线路的系统集成。Wang 等提出 RailLoMer，融合激光雷达、IMU、轮轴里程计与 GNSS，并利用轨道平面约束、结构描述及分阶段建图提高铁路环境中的鲁棒性\cite{wang2021raillomer}。同一研究方向的后续工作系统总结了铁路多模态定位与建图实践，讨论长距离运行、环境退化及工程部署问题\cite{wang2024fouryears}。这些工作表明，铁路定位需要联合考虑局部运动估计、结构约束和全局一致性，单纯引入更多观测并不足以保证稳定。
+
+GNSS 与激光惯性轨迹融合通常以位置因子约束累计漂移。实际融合效果还取决于时间同步、天线杆臂、坐标系、接收机协方差和异常值处理。对受多径影响的观测，如果仅按照其上报协方差赋予较高权重，可能将局部异常传播到地图。另一方面，过强地保持局部里程计，也可能限制有效 GNSS 对累计漂移的修正。因此，课题拟在已有因子图框架上研究质量控制，关注水平与垂向误差的差异，并探索使用历史可信高程趋势辅助复核异常观测。
+
+\subsection{铁路支柱与轨道提取研究}
+
+铁路点云目标提取主要包括基于几何规则的方法和基于学习的方法。几何方法通常利用高程、法向、线性结构、轨距及空间连续性筛选目标，具有流程清晰、对标注依赖较小的特点。Arastounia 对移动激光扫描铁路基础设施的自动提取进行了研究，展示了利用空间组织与几何特征识别铁路设施的可行性\cite{arastounia2015infrastructure}。对于轨道，局部截面、成对结构和沿线连续性可以提供比单点高度更稳定的判据；对于支柱，竖直连续性、轴线及截面形状有助于排除部分非目标。
+
+学习方法能够从复杂场景中获得语义标签，但通常依赖足够的标注数据，且还需处理类别不平衡、远距离稀疏观测与跨设备差异。国内 WHU-Railway3D 等数据资源推动了铁路点云场景的系统研究\cite{whurailway3d}；国外 SemanticRail3D 数据集进一步提供了铁路语义与实例分割评测资源\cite{ghasemlou2026semanticrail3d}。数据集建设使铁路场景评估逐步从个别案例转向更规范的比较，但离线高密度测绘点云上的分类效果，仍需与车载实时稀疏点云上的定位效果分别评价。
+
+国内在轨道几何提取方面也形成了较具体的方法。Lou 等结合几何、高程与强度信息研究快速轨道提取，说明局部特征和线路先验具有在线处理潜力\cite{lou2018rail}。Zou 等进一步研究不同线路构型下的轨道提取，通过方向估计、聚类和连续性处理应对弯道及道岔\cite{zou2019rail}。这些工作为本课题提供了几何筛选依据，但测绘位姿条件、点云密度和计算流程与本课题实时定位条件仍存在差异。
+
+现有提取方法对本课题的启示是：定位所需的目标表达不一定等同于完整语义分割结果。课题更关注支柱轴线及轨顶控制点能否被稳定复测、误差如何量化，以及它们进入地图后能否提供可靠定位约束。铁路格构柱、方柱和局部遮挡不完全满足圆柱模型；曲线、坡道和超高也不满足固定水平轨道截面假设。因此，需要将几何模型看作近似表达，并通过质量评估与适用条件控制其影响。
+
+\subsection{轻量地图与重定位研究}
+
+稠密点云定位常使用 ICP 及其改进方法。Generalized-ICP 利用局部表面协方差建立概率配准模型，为稠密地图定位提供了经典基础\cite{segal2009gicp}。Scan Context 则将三维扫描编码为全局描述子，用于地点检索及重访识别\cite{kim2018scancontext}。两类方法分别对应局部精配准与候选地点检索，往往需要协同使用。铁路长直线路和重复设施可能削弱描述子的区分性，因此获得相似候选并不等于已经获得可靠位姿。
+
+面向轻量定位，Schaefer 等研究了基于激光支柱地图的长期城市定位，说明稳定离散地标能够压缩环境表达\cite{schaefer2019poles}。更贴近本课题的是 Wortmann 等的铁路研究：其利用接触网支柱、二维轨道高精地图以及激光里程计和蒙特卡洛定位实现铁路定位\cite{wortmann2025rail}。因此，利用支柱与轨道进行轻量铁路定位已有直接先行工作，本课题不将这一总体组合本身作为原创结论。
+
+本课题拟进一步关注三维轨道几何、支柱轴线一致性和部分可观位姿约束。支柱能够提供离散位置锚点，但周期性布局容易产生区段混淆；轨道连续可见，却在直线且几何均匀区段缺少沿轨平移信息。二者联合的关键在于正确关联、可靠赋权与退化控制，而非简单叠加两个残差。与依赖全局检索的无先验定位相比，本课题首先研究具有粗略线路位置或已知起点条件下的局部重定位与持续跟踪，再根据数据条件探索较大初值误差下的候选区段检索。
+
+\subsection{研究趋势与本课题切入点}
+
+综合上述研究，可以归纳出以下趋势：几何表达由理想化平面向能够保留局部细节的表达发展；多源融合由增加观测数量向关注观测质量和方向性信息发展；地图表达由保存全部环境向保留任务相关结构发展；评价方式由单一轨迹误差向准确性、可靠性与资源消耗联合评价发展。
+
+现有方法仍为本课题留下三个具体研究空间。第一，铁路微小起伏的收益与噪声、采样尺度及退化方向之间缺少针对本研究数据的系统分析，需要验证“细节增强”是否在有效方向上提供信息。第二，面向定位的支柱与轨道提取需要兼顾稳定性和参数化误差，尤其要处理非圆截面、倾斜支柱、曲线超高及多线场景。第三，轻量地图定位需要明确支柱和轨道的互补边界，在地图规模下降的同时控制误匹配、坡道耦合和失锁恢复问题。本课题拟围绕这些可验证问题开展研究。
+
+\section{研究目标与主要研究内容}
+
+\subsection{总体目标与研究边界}
+
+本课题总体目标是构建“激光惯性与 GNSS 一致建图、支柱与轨道结构提取、轻量语义地图重定位”的完整方法链，在具有粗略初始位置的铁路重复运行场景中，降低先验地图负担并抑制里程计累计漂移。建图阶段允许使用 GNSS 和完整点云；查询定位阶段以实时激光雷达、IMU、支柱地图和轨道地图为输入，避免依赖全线路稠密点云。
+
+具体目标包括：分析并改善铁路非理想平面条件下的局部配准稳定性；形成具有统一坐标和质量信息的支柱、轨道地图；设计能够利用互补几何约束的重定位方法；建立独立数据与多指标评价流程。研究首先覆盖已采集线路中的长直、曲线、坡道、局部遮挡及停走片段，不预先宣称适用于所有高速、隧道或极端天气条件。无先验全线搜索、多线路岔区全局识别及长期地图自动维护作为条件允许时的扩展内容。
+
+\subsection{研究内容一：考虑起伏几何的激光惯性里程计与 GNSS 全局优化}
+
+围绕局部几何细节丢失和长距离漂移问题，研究体素定向高度图在铁路环境中的建模与配准。分析道床、轨枕及近似平面构筑物的起伏分布，比较不同体素尺度、像素尺度和点采样策略的精度与时间开销。研究结合几何质量与方向性信息的点选择方法，减少弱信息区域的冗余计算，避免噪声起伏被错误强化。
+
+在全局建图方面，利用 LIO 相对运动和 GNSS 位置构建轨迹优化模型，处理观测时刻不一致、天线杆臂和不确定度差异。研究鲁棒核、残差复核和协方差调整对异常观测的作用；探索根据历史可信高程及线路里程构建局部高程趋势，辅助识别垂向异常。采用优化轨迹重新投影去畸变点云，为后续结构地图提供一致的全局坐标。
+
+\subsection{研究内容二：铁路支柱与轨道提取及轻量地图构建}
+
+针对单帧点云稀疏和目标局部遮挡，采用基于行驶距离的多帧关键帧形成局部子图。支柱提取以铁路走廊为兴趣区域，结合高度连续性、连通性、聚类、轴线及截面拟合完成候选筛选，研究多指标质量评价与跨关键帧融合。重点分析倾斜柱、方柱及格构柱在简化模型下的误差，避免将外形拟合良好直接等同于位置估计可靠。
+
+轨道提取沿线路建立局部横断面，联合使用轨顶显著性、成对结构、软间距约束和三维连续性，输出左右轨顶控制点、局部切向及质量信息。研究适应坡道、超高和曲线的局部轨道坐标框架，将轨道表达由单一水平截面扩展为连续三维结构。地图仅保存定位所需的参数及必要元数据，并研究按线路里程分块加载，以支撑长线路使用。
+
+\subsection{研究内容三：基于支柱与轨道轻量语义地图的重定位}
+
+利用实时 LIO 提供连续运动预测，在粗初值附近构建候选地图窗口。支柱匹配结合柱轴、位置、半径、线路侧别和局部序列，研究一对一关联及多窗口一致性检验；轨道匹配结合成对关系、三维切向和空间连续性，研究对左右轨互换及相邻线路误关联的抑制。
+
+在位姿估计中，分析不同地图要素能够可靠约束的方向，并通过鲁棒部分位姿因子与 LIO 相对运动联合优化。重点研究支柱对离散位置的锚定与轨道对横向、法向及姿态的约束如何互补，避免以弱可观轨道信息强行修正沿线位置。同时设计跟踪、退化、失锁及恢复状态，使地标缺失时能够继续里程推算，并明确标记定位可信度下降。
+
+\section{研究思路、方法与技术路线}
+
+\subsection{总体思路与数据流}
+
+课题采用先建图、后重复定位的技术路线，如图~\ref{fig:route} 所示。第一阶段将局部几何配准与 GNSS 全局校正衔接，建立统一坐标下的环境与轨迹；第二阶段从中提取轻量结构；第三阶段通过实时观测与轻量地图的关联获得绝对修正，再与局部里程计联合输出连续位姿。这里的“语义”指具有支柱、钢轨等类别含义的参数化几何要素，不以深度语义分割网络作为必要前提。
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=6mm,
+  box/.style={draw,rounded corners,align=center,font=\small,
+              text width=4.35cm,minimum height=10mm,inner sep=4pt},
+  arr/.style={-{Latex[length=2mm]},thick}
+]
+  \node[box,fill=blue!7] (s1) {建图数据\\激光雷达、IMU、GNSS};
+  \node[box,below=of s1] (lio1) {起伏几何激光惯性里程计\\局部轨迹与去畸变点云};
+  \node[box,below=of lio1] (gnss) {鲁棒 GNSS 全局优化\\轨迹校正与点云重建};
+  \node[box,below=of gnss] (extract) {支柱与成对轨道提取\\质量评估与跨帧融合};
+  \node[box,fill=green!9,below=of extract] (map) {轻量语义地图\\柱轴地标、三维轨道及元数据};
+  \node[box,fill=blue!7,right=12mm of s1] (s2) {重复运行数据\\激光雷达、IMU及粗初值};
+  \node[box,below=of s2] (lio2) {在线激光惯性里程计\\运动预测与局部结构提取};
+  \node[box,below=of lio2] (match) {支柱、轨道候选关联\\鲁棒匹配与退化检验};
+  \node[box,below=of match] (graph) {互补约束增量优化\\LIO 相对因子与部分位姿因子};
+  \node[box,fill=green!9,below=of graph] (out) {地图坐标系连续定位\\状态评估与失锁恢复};
+  \draw[arr] (s1)--(lio1);
+  \draw[arr] (lio1)--(gnss);
+  \draw[arr] (gnss)--(extract);
+  \draw[arr] (extract)--(map);
+  \draw[arr] (s2)--(lio2);
+  \draw[arr] (lio2)--(match);
+  \draw[arr] (match)--(graph);
+  \draw[arr] (graph)--(out);
+  \draw[arr] (map.east)--++(5mm,0)|- (match.west);
+\end{tikzpicture}
+\caption{建图与查询定位分阶段实施的总体技术路线}
+\label{fig:route}
+\end{figure}
+
+\subsection{起伏几何表达与激光惯性里程计}
+
+定义 \(T_{AB}\) 为将 \(B\) 坐标系中的点变换到 \(A\) 坐标系的刚体变换，\(B\) 表示车体或 IMU 坐标系，\(O\) 表示局部里程计坐标系，\(M\) 表示地图坐标系。激光与 IMU 外参通过标定得到，点云先变换至统一机体系。局部运动状态可记为
+\begin{equation}
+  \vect{x}_k=
+  \left(R_{OB,k},\vect{p}_{OB,k},\vect{v}_{O,k},
+  \vect{b}_{g,k},\vect{b}_{a,k}\right).
+\end{equation}
+采用 IMU 传播预测运动，并依据各激光点时间戳进行扫描去畸变；随后进行点云配准和惯性状态更新。现有原型采用惯性预测、激光配准及惯性窗口更新的协同流程，后续首先在这一基础上研究铁路几何适配，不将其表述为已经完成全状态联合优化。
+
+对于地图体素 \(v\)，根据局部表面建立定向坐标系 \(C_v\)，将表面表达为高度函数 \(w=h_v(u_1,u_2)\)。待配准点在该坐标系中的位置为
+\begin{equation}
+  \vect{q}_i=T_{C_vO}T_{OB}\vect{p}_{B,i}
+  =\left(u_{1,i},u_{2,i},w_i\right)^\top ,
+\end{equation}
+相应高度残差和配准目标为
+\begin{equation}
+  r_i^H=w_i-h_v(u_{1,i},u_{2,i}),\qquad
+  \widehat T_{OB}=\arg\min_{T_{OB}}
+  \sum_i \rho\!\left((r_i^H/\sigma_i)^2\right).
+  \label{eq:height}
+\end{equation}
+式中，\(\rho\) 为鲁棒损失，\(\sigma_i\) 反映观测及局部表面质量。定向高度图是既有 BIEVR-LIO 方法基础；按质量设置权重及其铁路适配效果属于本课题拟分析的内容。与将整个区域近似为单一平面相比，式~\eqref{eq:height} 能保留局部起伏，但需要通过噪声和重复观测检验确认其有效性。
+
+拟从线性化几何残差构造信息矩阵
+\begin{equation}
+  H_G=\sum_i J_i^\top W_iJ_i,\qquad
+  H_N=D^\top H_GD,
+  \label{eq:information}
+\end{equation}
+其中 \(D\) 使用统一的平移和旋转尺度进行归一化。依据 \(H_N\) 的特征值、弱信息方向和空间分布评价退化，避免直接比较不同单位的位姿分量。点选择不仅考虑起伏幅值，还考虑梯度、观测次数及方向贡献；对无法获得有效约束的方向保留惯性预测并增大不确定度。该设计需与原始采样方法对比，验证新增计算是否能够换取稳定收益。
+
+\subsection{GNSS 鲁棒全局优化}
+
+将 GNSS 转换到统一局部 ENU 坐标，明确椭球高与其他高程基准的关系。设 \(T_i=(R_i,\vect{p}_i)\) 为待优化控制位姿，\(\widehat T_i\) 为 LIO 位姿，\(\vect{\ell}_B\) 为天线杆臂。相邻节点的里程计残差为
+\begin{equation}
+ r_{ij}^{O}=\Log\!\left[
+  (\widehat T_i^{-1}\widehat T_j)^{-1}(T_i^{-1}T_j)
+ \right].
+\end{equation}
+对于位于 \(t_i\) 与 \(t_j\) 之间的 GNSS 观测，令
+\(\alpha_k=(t_k-t_i)/(t_j-t_i)\)，构造天线位置插值残差
+\begin{equation}
+ \vect{r}_k^{G}=
+ (1-\alpha_k)(\vect{p}_i+R_i\vect{\ell}_B)
+ +\alpha_k(\vect{p}_j+R_j\vect{\ell}_B)
+ -\vect{z}_k^{G}.
+ \label{eq:gnss}
+\end{equation}
+该表达对应两个时刻的天线位置插值，需限制节点间隔以控制高速转动及曲线运动中的插值误差。全局目标由相对运动、鲁棒 GNSS 和必要先验组成：
+\begin{equation}
+ \min_{\{T_i\}}\;
+ \sum_{(i,j)}\|r_{ij}^{O}\|_{\Sigma_{ij}^{O}}^2
+ +\sum_k\rho_G\!\left(
+  \|\vect{r}_k^{G}\|_{\Sigma_k^{G}}^2\right)
+ +E_{\mathrm{prior}},
+ \label{eq:global}
+\end{equation}
+其中 \(\|r\|_{\Sigma}^{2}=r^\top\Sigma^{-1}r\)。姿态先验用于保持可信的重力方向和初始规范，不将坡道上的车体俯仰强制设为零。
+
+已有原型支持标准差下限、鲁棒核、初始对齐异常筛选及优化后的归一化残差复核。拟进一步研究接收机协方差和观测一致性联合赋权，明确固定噪声覆盖与自适应噪声的实验区别。对于历史高程趋势复核，拟使用此前已确认的可信位置，以线路里程 \(s\) 建立局部模型
+\begin{equation}
+ \widehat z(s)=a_0+a_1(s-s_0)+a_2(s-s_0)^2,\qquad
+ \eta_z=\frac{z_k^G-\widehat z(s_k)}
+ {\sqrt{\sigma_{G,z}^2+\sigma_{\mathrm{trend}}^2}}.
+ \label{eq:trend}
+\end{equation}
+依照模型不确定度和残差进行正常接收、降权或拒绝。当前观测不参与其自身的趋势预测；在竖曲线、基线不足或可信历史不足时暂停该检验，避免误拒真实高程变化。该趋势策略是待完成的研究内容，其门限须由验证集确定，不能以演示回放代替闭环验证。
+
+\subsection{支柱提取、融合与参数化地图}
+
+按车辆行驶距离形成多帧关键帧，并对停走条件设置最大帧数和相邻窗口重叠。沿关键帧轨迹折线建立铁路走廊兴趣区域，进行栅格高度连续性、连通区域与欧式聚类筛选，得到支柱候选。对候选利用 PCA 估计轴向，在轴线法平面上进行鲁棒截面拟合，结合轴倾角、拟合残差、内点比例、角度覆盖和可见长度评价质量。
+
+对非圆支柱，圆截面参数主要作为候选特征和近似描述，不能直接解释为真实结构半径。拟分析不同柱型的系统偏差，对明显不适用的候选降低权重或使用简化轴线描述。跨关键帧融合时，将支柱表示为轴上一点 \(\vect{a}\) 和单位方向 \(\vect{d}\)。与参考高程 \(z^\ast\) 平面的交点为
+\begin{equation}
+ \vect{c}(z^\ast)=
+ \vect{a}+\frac{z^\ast-a_z}{d_z}\vect{d}.
+ \label{eq:pole}
+\end{equation}
+该表达仅用于满足近竖直条件的支柱。对于倾斜支柱，应先将观测轴线变换至同一坐标系，再在共同高程比较，避免不同取点高度造成虚假的横向差异；同时考虑高程不确定度对外推误差的影响。
+
+地图支柱条目拟包含唯一编号、轴线参数、有效高度范围、截面描述、重复观测次数、拟合质量和协方差。线路里程、左右侧及相邻支柱间距可用于抑制周期性关联混淆。地图级保存坐标定义、ENU 原点、高程基准、格式版本和创建参数，保证不同采集批次之间的可追溯性。
+
+\subsection{轨道提取与三维矢量表达}
+
+沿局部轨迹划分横断面，在断面内形成横向高度统计，筛选具有轨顶显著性的候选。通过左右轨成对关系、合理间距、邻近断面的横向与垂向连续性获得有效轨段。轨距先验采用软约束，且须区分“拟合轨顶特征点间距”与具有特定测量位置定义的工程轨距；两者未经标定不能直接等同。真实超高也不能被固定的左右等高约束消除。
+
+设左右轨三维曲线为 \(\vect{r}_L(s)\) 和 \(\vect{r}_R(s)\)，中心线为
+\(\vect{c}(s)=[\vect{r}_L(s)+\vect{r}_R(s)]/2\)，其中里程 \(s\) 沿地图固定方向递增。构造单位切向、横向及法向：
+\begin{equation}
+\begin{aligned}
+ \vect{t}&=\frac{\vect{c}'(s)}{\|\vect{c}'(s)\|},\\
+ \widetilde{\vect{b}}&=(I-\vect{t}\vect{t}^{\top})
+       (\vect{r}_L-\vect{r}_R),\\
+ \vect{b}&=\frac{\widetilde{\vect{b}}}{\|\widetilde{\vect{b}}\|},
+ \qquad \vect{n}=\vect{t}\times\vect{b}.
+\end{aligned}
+\end{equation}
+该框架要求有效切向和可分辨的成对轨观测，可随曲线、坡度和超高变化。左右轨和支柱侧别均相对于地图固定方向定义，反向运行时转换观测标签；轴线和切向匹配同时处理符号二义性。实际提取先使用轨迹及惯性信息形成初始断面，再根据成对轨观测迭代更新框架，避免依赖尚未得到的精确地图。
+
+拟将横断面的轨道选择表示为局部显著性与连续性代价的联合优化：
+\begin{equation}
+ E_R=\sum_k
+ \left(E_{\mathrm{top},k}
+ +\lambda_g E_{\mathrm{spacing},k}\right)
+ +\sum_k\left(
+ \lambda_c E_{\mathrm{continuity},k}
+ +\lambda_t E_{\mathrm{tangent},k}\right).
+\end{equation}
+在实际实现中可采用逐断面筛选与邻接连续性验证，或在困难区段采用有限候选的序列优化。最终保存左右轨顶控制点、线路切向、有效轨段和质量信息，按几何变化自适应稀疏化，避免在直线段保存过密控制点。道岔和多股道区域需保留分支身份，无法确认时拒绝参与定位。
+
+\subsection{互补约束重定位与增量融合}
+
+定位开始时，由已知起点、人工初始位姿或可用的粗定位提供地图坐标初值。系统利用 LIO 预测当前位置，从地图中加载邻近线路区段。对支柱，结合位置门控、轴线、截面及序列关系生成候选，进行一对一分配和鲁棒位姿估计；以匹配数量、残差、空间基线和连续窗口一致性检验结果。需要区分数学最小条件与工程门限：已知正确对应时，两组不重合的二维点通常即可确定平面刚体变换，而更多支柱主要用于抗噪和排除错误对应。
+
+对轨道，将实时成对轨控制点与地图轨段关联。设关联点为 \(\vect{p}_i\) 和 \(\vect{q}_i\)，地图切向为 \(\vect{t}_i\)，法平面基为 \(B_i=[\vect{b}_i,\vect{n}_i]\)，构造二维位置残差
+\begin{equation}
+ \vect{r}_i^{R,\mathrm{raw}}=B_i^\top(T_{MB}\vect{p}_i-\vect{q}_i),
+ \qquad B_i^\top\vect{t}_i=\vect{0}.
+ \label{eq:rail}
+\end{equation}
+必要时叠加切向与成对轨姿态一致性。式~\eqref{eq:rail} 不对单个对应点的切向位移施加虚假约束。在局部直线且几何均匀的坡道上，轨道位置约束的弱信息方向沿三维切向，并包含垂向分量；在曲线或变坡区段，不同位置的切向变化可能提供部分沿线信息，应通过聚合信息矩阵判断。轨道能够约束哪些姿态分量，还取决于可见长度、成对观测和地形变化。
+
+在后端，以关键帧地图位姿为变量，加入 LIO 相对运动和经过验收的支柱、轨道部分位姿观测：
+\begin{equation}
+ \min_{\{T_k\}}
+ \sum\|r_{ij}^{O}\|_{\Sigma_O}^2
+ +\sum\rho_P(\|\bar r_k^{P}\|_{\Sigma_P}^2)
+ +\sum\rho_R(\|\bar r_k^{R}\|_{\Sigma_R}^2)
+ +E_{\mathrm{init}}.
+ \label{eq:localization}
+\end{equation}
+式中 \(\bar r_k^{P}\)、\(\bar r_k^{R}\) 为前端结构匹配汇总得到的部分位姿残差。已有原型采用汇总结果与增量因子图融合，其中轨道因子使用水平横向位置、高程及姿态分量；三维法平面约束及其弱信息方向保持属于拟研究内容。拟进一步研究汇总观测的协方差标定和相关性，特别是重叠窗口重复使用同一地标所造成的过度自信。不会将同一批匹配结果同时作为独立原始因子和独立汇总因子重复计权。
+
+输出通过
+\begin{equation}
+ T_{MB}(t)=T_{MO}(t)T_{OB}(t)
+\end{equation}
+将连续 LIO 位姿转换到地图坐标。后台提取结果按传感器时间戳关联，减少异步调度对融合顺序的影响。依据新地标支持、累计未校正距离及创新统计量划分初始化、搜索、跟踪、退化和失锁状态；恢复定位需连续证据确认。无有效结构时继续 LIO 推算，同时记录不确定度和失锁区段。
+
+\section{研究重点、难点与拟解决措施}
+
+\subsection{主要研究重点}
+
+第一，建立局部起伏几何、全局地图基准和轻量结构地图之间的一致方法链。前端误差会影响支柱和轨道的参数，而地图误差又会影响重定位，需要避免各模块分别优化却缺少误差衔接。第二，将几何质量与定位信息联系起来，评价支柱轴线、轨道控制点及空间基线是否能够支撑所需位姿约束。第三，建立与应用目标一致的评价体系，在保证基本定位可靠性的前提下度量地图压缩和计算收益。
+
+\subsection{主要难点与解决思路}
+
+\begin{enumerate}[label=\arabic*.]
+ \item \textbf{起伏细节与测量噪声难以区分。}
+ 拟结合多次观测一致性、距离及入射条件分析有效几何，开展像素尺度和采样策略消融；仅在稳定信息不足时保守更新，不以更细分辨率必然更准确为前提。
+ \item \textbf{重复支柱容易造成离散误匹配。}
+ 拟结合线路侧别、间距序列、运动连续性和多窗口验证约束候选，必要时保留多个区段假设。支柱共线不必然使已知对应的平面配准退化，真正需要重点处理的是短基线噪声和周期布局混淆。
+ \item \textbf{三维轨道约束存在方向耦合。}
+ 拟采用随线路变化的局部坐标和法平面残差，分别分析直线、坡道、超高及曲线；以支柱与 LIO 补充沿线信息，避免错误的满秩假设。
+ \item \textbf{GNSS 异常可能污染地图。}
+ 拟进行协方差合理性检查、鲁棒优化及历史趋势复核，并通过可控异常注入评价误拒和漏检。高程趋势在真实线路变化处应降低置信度。
+ \item \textbf{地图误差与观测相关性难以准确建模。}
+ 拟采用重复采集估计参数离散程度，对重叠窗口降频或进行相关性近似处理；比较启发式权重与经验标定权重，检查置信度是否与实际误差相符。
+ \item \textbf{长线路实时运行与状态恢复。}
+ 拟采用里程分块、局部索引与异步处理，记录队列积压和丢帧；通过遮挡、地图缺失及初值扰动实验检验退化检测与恢复能力。
+\end{enumerate}
+
+\section{可能的创新点与不足之处}
+
+\subsection{拟形成的创新点}
+
+\begin{enumerate}[label=\arabic*.]
+ \item \textbf{面向铁路非理想平面环境的起伏几何适配与可靠建图方法。}
+ 在已有定向高度图基础上，研究结合重复观测质量和归一化方向性信息的采样与退化控制，并探索基于线路里程的可信高程趋势复核。拟通过方向误差、异常检测及地图几何一致性实验，验证其相对直接应用基础框架的作用。
+ \item \textbf{面向定位的支柱轴线与三维成对轨道提取及质量表达。}
+ 研究倾斜支柱共同高程比较、柱型适应和跨关键帧质量融合；利用随线路变化的轨道局部框架处理坡度及超高，将提取结果组织为包含质量信息的轻量地图。创新应体现在明确的误差处理和结构适配上，而非将聚类、RANSAC 或 PCA 本身作为创新。
+ \item \textbf{考虑重复结构与部分可观性的支柱、轨道互补重定位方法。}
+ 面向三维铁路场景，联合离散轴线地标、连续轨道法平面约束和 LIO 运动，研究关联确认、部分位姿融合及退化恢复，在定位精度与地图、计算负担之间获得可量化的改进。
+\end{enumerate}
+
+上述内容属于待验证的创新设想。定向高度图、因子图、Hungarian 分配、鲁棒核、iSAM2 以及支柱和轨道联合用于铁路定位均有先行研究。本课题需要通过明确的新模型、适用条件和对比实验确认实际贡献，不能仅以系统组合或应用场景替换作为充分创新依据。
+
+\subsection{可能存在的不足}
+
+本研究可能受到以下限制：其一，轻量地图会丢弃部分环境细节，在支柱缺失且轨道沿线信息不足时，定位依赖 LIO 连续推算；其二，重复布局可能使较大初值误差难以消除，现阶段不保证无先验全线定位；其三，几何规则对不同柱型、道床、设备密度和传感器扫描方式存在参数敏感性；其四，地图精度受到建图轨迹及 GNSS 高程基准制约，精确拟合地图不等于绝对位置准确；其五，当前实测数据的线路、速度、天气及重复采集覆盖有限，结论需说明适用范围；其六，初期协方差建模仍可能采用近似，难以完全描述地图与实时观测的相关性。课题将公开失败样例，并通过独立测试和分场景统计呈现这些不足。
+
+\section{实验设计、评价指标与可行性分析}
+
+\subsection{数据组织与评价原则}
+
+拟以襄阳铁路实测激光雷达、IMU 及 GNSS 数据为主要研究对象，结合公开数据进行补充分析。公开铁路语义点云主要用于提取评测，不默认具备同步 IMU、完整时序和定位真值。现有数据整理已列出多个单方向片段及不同批次采集线索，后续需核验不同日期和往返区段的空间重合、传感器配置及参考质量。按线路区段和采集批次划分开发、验证与测试数据，避免将相邻高度重叠窗口随机分割后误认为独立样本。
+
+建图与定位测试优先采用同一路段的独立重复采集，参数在验证集确定后固定。现有同一数据复放可用于检查软件链路、局部收敛和运行确定性，但不能替代跨趟次复测。已有资料中的同源参考误差和 GNSS 拟合残差不作为独立真值精度使用。
+
+参考轨迹优先采用经过质量核验的独立 GNSS/INS 组合结果或测量控制信息。若实际只能获得参与建图优化的 GNSS，则相关结果明确标记为观测一致性或相对参考误差，并通过留出观测、可控扰动和局部地图几何检验补充证据。还需完成杆臂和时间基准核验，防止把标定误差归因于定位算法。
+
+\subsection{对比与消融方案}
+
+\begin{longtable}{p{2.5cm}p{5.7cm}p{5.4cm}}
+\caption{主要对比实验与消融设计}\label{tab:experiments}\\
+\toprule
+研究环节 & 实验配置 & 主要验证问题\\
+\midrule
+\endfirsthead
+\toprule
+研究环节 & 实验配置 & 主要验证问题\\
+\midrule
+\endhead
+局部里程计 &
+FAST-LIO2、Faster-LIO、原始 BIEVR-LIO、铁路适配方案；相同传感器输入与合理参数调优 &
+微小起伏利用和采样设计是否改善方向误差与退化稳定性\\
+GNSS 优化 &
+仅 LIO、直接 GNSS 融合、鲁棒与残差筛选、拟议质量赋权及高程趋势复核 &
+各质量控制环节是否有效，是否误拒真实坡道高程变化\\
+支柱提取 &
+粗筛、粗筛加轴线/截面质量过滤、共同高程关联、跨帧质量融合 &
+误检、漏检、轴线位置重复性及倾斜柱外推误差\\
+轨道提取 &
+单断面选择、成对与连续性约束、三维局部框架 &
+轨顶误差、完整性、曲线坡道超高适应性\\
+轻量定位 &
+相同 LIO 与初值下的纯里程计、稠密 GICP、支柱地图、轨道地图、支柱与轨道联合 &
+各结构的约束作用，以及轻量方案与稠密地图方案的精度和资源差异\\
+鲁棒性与资源 &
+初值网格扰动、支柱缺失、轨道遮挡、地图截断、相邻线路干扰及地图控制点稀疏化 &
+捕获范围、错误锁定、失锁恢复和地图压缩的代价\\
+\bottomrule
+\end{longtable}
+
+GNSS 实验需分别记录水平跳变、垂向偏置和连续失效条件，可控异常注入与自然异常分开统计。提取实验对部分代表区段进行人工标注或测量核验，避免仅以定位结果反推提取正确性。对于直接先行铁路轻量定位方法，优先在公开实现和数据条件允许时复现；无法公平复现时，明确差异并进行机制层面的比较。
+
+\subsection{评价指标与预期成果}
+
+轨迹评价采用绝对轨迹误差、相对位姿误差及方向分解误差，报告 RMSE、P95、最大值和末端误差。使用线路局部坐标分解沿轨、横轨和法向误差，并单独报告姿态误差。局部里程计可进行一次统一刚体对齐用于漂移比较；地图定位只使用事先给定的初始坐标关系，不能再用整段测试轨迹重新拟合消除错误。同步报告有效定位率和失败区段，避免仅保留成功片段。
+
+支柱评价包括精确率、召回率、轴线位置和方向误差、重复观测稳定性；轨道评价包括轨顶控制点距离、切向偏差、有效覆盖和错误关联率。重定位评价包括成功率、首次收敛时间、允许初值范围、错误区段锁定率、失锁检测及恢复距离。成功判据在实验前根据参考质量和任务需求确定，避免事后调整。
+
+轻量性同时统计单位线路长度的地图字节数、常驻及峰值内存、地图加载时间、匹配与优化的中位数和 P95 延迟，并将前端提取耗时计入在线总开销。稠密地图对照采用合理降采样和局部加载，双方使用相同硬件、输入频率与初值。定位阶段仅省去全线路稠密先验地图，LIO 仍需维护局部几何地图，因此应分别报告先验地图开销和系统整体开销。
+
+预期形成三类成果：一套可复现的铁路建图与轻量重定位原型；一组经过质量核验的轨迹、结构地图、标注及实验配置；一篇系统阐明方法、对比结果及适用边界的硕士论文。目标是在目标设备上满足传感器输入速率，在可接受的定位精度和失败率下显著降低先验地图负担；具体数值由验证集和资源测量确定，不将尚未完成的目标写为实验结论。
+
+\subsection{前期工作基础与可行性}
+
+现有工程已包含激光惯性前端、去畸变点云归档、GNSS 记录与批量轨迹优化、优化轨迹地图重建、支柱和轨道提取、稀疏地图定位及增量图后端，并保留稠密 GICP 定位作为对照。支柱提取已采用距离关键帧、轨迹走廊筛选、轴线与截面拟合；轨道地图已保存成对控制点和切向信息；定位原型已能够将结构匹配汇总为部分位姿观测并与 LIO 相对运动融合。
+
+这些前期工作表明，课题具备开展算法研究和消融验证的工程基础，但不代表所有拟研究机制已完成。历史高程趋势复核、系统化协方差标定、三维线路框架下的约束分析、长线路分块加载及独立跨趟次验收仍需进一步完成。正式实验应固定代码版本、配置及输入清单，以保证结论可追溯。
+
+课题使用成熟的几何处理、非线性最小二乘和增量优化工具，核心环节具备可分阶段实现与验证的条件。实施中优先完成独立重复采集、基础对比和关键误差模型，再推进可选的全线候选检索及地图维护，以保证硕士阶段研究范围可控。
+
+\section{论文主要内容及初步框架}
+
+论文拟分为六章，章节安排如下。
+
+\begin{enumerate}[label=第\arabic*章：,leftmargin=5em]
+ \item \textbf{绪论。}
+ 介绍铁路列车轻量定位的研究背景、价值与挑战，梳理国内外研究现状，明确研究问题、主要内容和技术路线。
+ \item \textbf{系统基础与铁路定位问题建模。}
+ 介绍传感器与坐标系、时间同步和外参、激光惯性估计、非线性优化及地图表达；分析铁路起伏几何、重复结构和可观性，给出数据与评价原则。
+ \item \textbf{考虑起伏几何的激光惯性里程计与 GNSS 全局建图。}
+ 介绍定向高度图基础、铁路几何适配、点选择与退化分析、GNSS 鲁棒优化和地图重建，开展轨迹、质量控制及地图一致性实验。
+ \item \textbf{铁路支柱与轨道提取及轻量语义地图构建。}
+ 介绍距离关键帧、支柱筛选与轴线融合、成对轨道三维提取、质量表达及地图组织，开展人工核验与模型消融。
+ \item \textbf{基于支柱与轨道互补约束的轻量重定位。}
+ 介绍候选关联、鲁棒匹配、部分位姿因子、增量融合和状态恢复，比较纯支柱、纯轨道、联合方案及稠密地图定位，分析资源与失败样例。
+ \item \textbf{总结与展望。}
+ 总结经验证的研究结论与贡献，分析数据、泛化和模型不足，讨论无先验定位、多线路识别及长期地图维护等后续方向。
+\end{enumerate}
+
+\section{研究进度安排}
+
+进度以开题通过后的 12 个月为周期，可结合学校安排调整；论文写作、数据管理和实验记录贯穿全过程。
+
+\begin{longtable}{p{2.3cm}p{7.3cm}p{4.0cm}}
+\caption{研究进度及阶段成果}\label{tab:schedule}\\
+\toprule
+时间 & 主要任务 & 阶段成果\\
+\midrule
+\endfirsthead
+\toprule
+时间 & 主要任务 & 阶段成果\\
+\midrule
+\endhead
+第 1--2 个月 &
+完成重点文献整理、代码版本冻结、数据区段核验及时间/外参检查；确认独立建图与查询数据和参考来源 &
+问题定义、数据清单、基线复现与实验规范\\
+第 3--4 个月 &
+完成起伏几何尺度分析、采样及退化策略；开展 GNSS 鲁棒优化与高程趋势复核研究，检查地图几何一致性 &
+研究内容一方法与消融结果，论文第三章初稿\\
+第 5--6 个月 &
+完善支柱轴线比较与跨帧融合、轨道三维框架、质量标定及轻量地图格式；完成代表区段标注 &
+支柱/轨道提取评价、地图样例，论文第四章初稿\\
+第 7--8 个月 &
+完善支柱轨道关联、互补约束与增量融合，完成独立跨趟次定位、初值扰动和失锁恢复实验 &
+轻量定位原型、主要精度与鲁棒性结果\\
+第 9--10 个月 &
+完成稠密地图公平对照、地图压缩和运行资源测试；补充坡道曲线、遮挡及失败分析，整理全部实验 &
+完整对比与消融表图，论文第五章初稿\\
+第 11 个月 &
+完成论文全文、核查引用与贡献边界，开展重复运行检查和代码、数据归档 &
+硕士论文完整初稿与可复现实验材料\\
+第 12 个月 &
+按导师意见修改，完成预答辩、查漏补缺、终稿排版及答辩准备 &
+论文终稿、答辩材料和成果归档\\
+\bottomrule
+\end{longtable}
+
+\begingroup
+\small
+\renewcommand{\refname}{主要参考文献}
+\begin{thebibliography}{99}
+\addcontentsline{toc}{section}{主要参考文献}
+\bibitem{zhang2014loam}
+Zhang J, Singh S.
+LOAM: Lidar Odometry and Mapping in Real-time[C]//
+Robotics: Science and Systems. 2014.
+DOI: \href{https://doi.org/10.15607/RSS.2014.X.007}{10.15607/RSS.2014.X.007}.
+
+\bibitem{shan2020liosam}
+Shan T, Englot B, Meyers D, et al.
+LIO-SAM: Tightly-coupled Lidar Inertial Odometry via Smoothing and Mapping[C]//
+IEEE/RSJ International Conference on Intelligent Robots and Systems. 2020.
+\url{https://arxiv.org/abs/2007.00258}.
+
+\bibitem{forster2017preintegration}
+Forster C, Carlone L, Dellaert F, et al.
+On-Manifold Preintegration for Real-Time Visual-Inertial Odometry[J].
+IEEE Transactions on Robotics, 2017, 33(1): 1--21.
+DOI: \href{https://doi.org/10.1109/TRO.2016.2597321}{10.1109/TRO.2016.2597321}.
+
+\bibitem{kaess2012isam2}
+Kaess M, Johannsson H, Roberts R, et al.
+iSAM2: Incremental Smoothing and Mapping Using the Bayes Tree[J].
+The International Journal of Robotics Research, 2012, 31(2): 216--235.
+DOI: \href{https://doi.org/10.1177/0278364911430419}{10.1177/0278364911430419}.
+
+\bibitem{xu2022fastlio2}
+Xu W, Cai Y, He D, et al.
+FAST-LIO2: Fast Direct LiDAR-Inertial Odometry[J].
+IEEE Transactions on Robotics, 2022, 38(4): 2053--2073.
+DOI: \href{https://doi.org/10.1109/TRO.2022.3141876}{10.1109/TRO.2022.3141876}.
+
+\bibitem{bai2022fasterlio}
+Bai C, Xiao T, Chen Y, et al.
+Faster-LIO: Lightweight Tightly Coupled Lidar-Inertial Odometry Using Parallel Sparse Incremental Voxels[J].
+IEEE Robotics and Automation Letters, 2022, 7(2): 4861--4868.
+DOI: \href{https://doi.org/10.1109/LRA.2022.3152830}{10.1109/LRA.2022.3152830}.
+
+\bibitem{zhang2016degeneracy}
+Zhang J, Kaess M, Singh S.
+On Degeneracy of Optimization-Based State Estimation Problems[C]//
+IEEE International Conference on Robotics and Automation. 2016: 809--816.
+DOI: \href{https://doi.org/10.1109/ICRA.2016.7487211}{10.1109/ICRA.2016.7487211}.
+
+\bibitem{tuna2024xicp}
+Tuna T, Nubert J, Nava Y, et al.
+X-ICP: Localizability-Aware LiDAR Registration for Robust Localization in Extreme Environments[J].
+IEEE Transactions on Robotics, 2024, 40: 452--471.
+DOI: \href{https://doi.org/10.1109/TRO.2023.3335691}{10.1109/TRO.2023.3335691}.
+
+\bibitem{pfreundschuh2026bievr}
+Pfreundschuh P, Tuna T, Le Gentil C, et al.
+BIEVR-LIO: Robust LiDAR-Inertial Odometry through Bump-Image-Enhanced Voxel Maps[C]//
+Robotics: Science and Systems. 2026.
+DOI: \href{https://doi.org/10.15607/RSS.2026.XXII.049}{10.15607/RSS.2026.XXII.049}.
+\url{https://www.roboticsproceedings.org/rss22/p049.html}.
+
+\bibitem{heirich2013railslam}
+Heirich O, Robertson P, Strang T.
+RailSLAM---Localization of Rail Vehicles and Mapping of Geometric Railway Tracks[C]//
+IEEE International Conference on Robotics and Automation. 2013: 5212--5219.
+DOI: \href{https://doi.org/10.1109/ICRA.2013.6631322}{10.1109/ICRA.2013.6631322}.
+
+\bibitem{wang2021raillomer}
+Wang Y, Lou Y, Zhang Y, et al.
+RailLoMer: Rail Vehicle Localization and Mapping with LiDAR-IMU-Odometer-GNSS Data Fusion[EB/OL].
+arXiv:2111.15043, 2021.
+\url{https://arxiv.org/abs/2111.15043}.
+
+\bibitem{wang2024fouryears}
+Wang Y, Song W, Zhang Y, et al.
+Four Years of Multimodal Odometry and Mapping on the Rail Vehicles[J].
+Journal of Field Robotics, 2024, 41(2): 227--257.
+DOI: \href{https://doi.org/10.1002/rob.22256}{10.1002/rob.22256}.
+
+\bibitem{arastounia2015infrastructure}
+Arastounia M.
+Automated Recognition of Railroad Infrastructure in Rural Areas from LIDAR Data[J].
+Remote Sensing, 2015, 7(11): 14916--14938.
+DOI: \href{https://doi.org/10.3390/rs71114916}{10.3390/rs71114916}.
+
+\bibitem{whurailway3d}
+Qiu B, Zhou Y, Dai L, et al.
+WHU-Railway3D: A Diverse Dataset and Benchmark for Railway Point Cloud Semantic Segmentation[J].
+IEEE Transactions on Intelligent Transportation Systems, 2024, 25(12): 20900--20916.
+DOI: \href{https://doi.org/10.1109/TITS.2024.3469546}{10.1109/TITS.2024.3469546}.
+
+\bibitem{ghasemlou2026semanticrail3d}
+Ghasemlou A, Soilán M, Riveiro B.
+SemanticRail3D---A Mobile LiDAR Benchmark for Semantic and Instance Segmentation of Railway Corridors[J].
+Scientific Data, 2026, 13: 82.
+DOI: \href{https://doi.org/10.1038/s41597-025-06392-9}{10.1038/s41597-025-06392-9}.
+
+\bibitem{lou2018rail}
+Lou Y, Zhang T, Tang J, et al.
+A Fast Algorithm for Rail Extraction Using Mobile Laser Scanning Data[J].
+Remote Sensing, 2018, 10(12): 1998.
+DOI: \href{https://doi.org/10.3390/rs10121998}{10.3390/rs10121998}.
+
+\bibitem{zou2019rail}
+Zou R, Fan X, Qian C, et al.
+An Efficient and Accurate Method for Different Configurations Railway Extraction Based on Mobile Laser Scanning[J].
+Remote Sensing, 2019, 11(24): 2929.
+DOI: \href{https://doi.org/10.3390/rs11242929}{10.3390/rs11242929}.
+
+\bibitem{segal2009gicp}
+Segal A, Haehnel D, Thrun S.
+Generalized-ICP[C]//Robotics: Science and Systems. 2009.
+DOI: \href{https://doi.org/10.15607/RSS.2009.V.021}{10.15607/RSS.2009.V.021}.
+
+\bibitem{kim2018scancontext}
+Kim G, Kim A.
+Scan Context: Egocentric Spatial Descriptor for Place Recognition within 3D Point Cloud Map[C]//
+IEEE/RSJ International Conference on Intelligent Robots and Systems. 2018: 4802--4809.
+DOI: \href{https://doi.org/10.1109/IROS.2018.8593953}{10.1109/IROS.2018.8593953}.
+
+\bibitem{schaefer2019poles}
+Schaefer A, Büscher D, Vertens J, et al.
+Long-Term Urban Vehicle Localization Using Pole Landmarks Extracted from 3-D Lidar Scans[C]//
+European Conference on Mobile Robots. 2019: 1--7.
+DOI: \href{https://doi.org/10.1109/ECMR.2019.8870928}{10.1109/ECMR.2019.8870928}.
+
+\bibitem{wortmann2025rail}
+Wortmann J, Wulff F, Schäufele B, et al.
+LiDAR Based Landmark and Odometry Fusion for Precise Rail Localization Without Additional Infrastructure[C]//
+101st IEEE Vehicular Technology Conference (VTC2025-Spring). 2025: 1--6.
+DOI: \href{https://doi.org/10.1109/VTC2025-Spring65109.2025.11174496}{\nolinkurl{10.1109/VTC2025-Spring65109.2025.11174496}}.
+\end{thebibliography}
+\endgroup
+\end{document}

@@ -97,6 +97,19 @@ BIEVR-LIO provides two ROS1 entry points:
 - **`process_bag`** reads a recorded bag directly and pushes its messages through
   the pipeline as fast as they can be processed (no real-time playback). This is the preferred choice for offline evaluation and reproducing results.
 
+同一次采集被拆成多个 bag 时，可重复传入 `--bag`。程序只创建一次 LIO、关键帧
+提取器和定位器，按命令行顺序连续处理，并在全部 bag 结束后统一保存；不要分别启动
+三个进程，否则 IMU 状态、里程计和关键帧窗口会在边界处重置：
+
+```bash
+rosrun bievr_lio_ros process_bag --sensor_config_file config/sensor_configs/xiangyang.yaml \
+  --params_file config/params.yaml \
+  --bag /data/bag2.bag --bag /data/bag3.bag --bag /data/bag4.bag
+```
+
+在线连续播放多个 bag 时，保持同一个前端和 GNSS 记录节点运行，共用一个 ENU 原点及
+点云归档。`gnss_optimize` 只读取已保存的 GNSS 文本、LIO 轨迹和点云归档，不读取 bag。
+
 ### Quick start（中文）
 
 每次打开新终端后，先加载 ROS 和工作空间环境（请将路径替换为自己的
@@ -115,42 +128,33 @@ catkin build bievr_lio_ros
 source devel/setup.bash
 ```
 
-离线处理 rosbag（推荐）前，直接编辑
-`interfaces/ros1/launch/process_bag.launch` 顶部的 `sensor_config` 和
-`rosbag` 默认值，例如：
+建图时，先编辑 `interfaces/ros1/launch/mapping.launch` 中
+`process_topics` 节点的 YAML 路径。默认使用 `$(find bievr_lio_ros)`
+定位 ROS 包，因此更换工作空间时无需修改绝对路径：
 
 ```xml
-<arg name="sensor_config" default="ncd"/>
-<arg name="rosbag" default="/absolute/path/to/data.bag"/>
+args="--sensor_config_file $(find bievr_lio_ros)/../../config/sensor_configs/xiangyang.yaml --params_file $(find bievr_lio_ros)/../../config/params.yaml"
 ```
 
-然后启动时不需要再从终端传入配置：
+启动时不需要传入 YAML 或 bag 参数。终端 1 启动建图节点
+（`roslaunch` 会在需要时自动启动 ROS master）：
 
 ```bash
-roslaunch bievr_lio_ros process_bag.launch
+roslaunch bievr_lio_ros mapping.launch
 ```
 
-程序会直接读取 bag，不需要另外执行 `rosbag play`。`sensor_config` 可选
-`enwide`、`ncd`、`gamma`、`mars`、`grandtour`、`xiangyang`、`tzb`，也可以传入自定义 YAML
-配置文件的绝对路径。
-
-在线处理雷达和 IMU 话题前，编辑
-`interfaces/ros1/launch/process_topics.launch` 顶部的 `sensor_config` 默认值，
-然后直接启动：
-
-```bash
-roslaunch bievr_lio_ros process_topics.launch
-```
-
-如果数据来自 rosbag，请在另一个已经 source 工作空间的终端中播放：
+终端 2 播放 bag：
 
 ```bash
 rosbag play /absolute/path/to/data.bag
 ```
 
-需要 RViz 时，在上述 `roslaunch` 命令末尾添加 `rviz:=true`。
+这两个终端都需要先 source ROS 和工作空间。`mapping.launch` 默认启动
+RViz；不需要时可使用 `roslaunch bievr_lio_ros mapping.launch rviz:=false`。
+如果 bag 中记录了 `/clock` 且系统使用仿真时间，播放时添加 `--clock`。
 
-在线模式使用 `Ctrl+C` 正常结束；离线模式会在 bag 处理完成后自动结束。
+等 `rosbag play` 播放完成后，在终端 1 按 `Ctrl+C` 正常结束建图节点；
+请勿使用 `kill -9`。直接读取 bag 的 `process_bag` 模式则会在处理完成后自动结束。
 结束时程序会等待尚未累计完成的点云，并创建 `Log` 目录，输出：
 
 | File | Description |
@@ -160,10 +164,13 @@ rosbag play /absolute/path/to/data.bag
 | `Log/odometry_tum.txt` | TUM 格式里程计，字段为 `timestamp tx ty tz qx qy qz qw` |
 | `Log/localization_tum.txt` | Localization 模式输出的地图坐标系定位轨迹；只有成功定位后才生成 |
 | `Log/poles/landmarks.txt` | 去重后的支柱坐标、柱轴、观测次数、拟合半径和 RMS |
+| `Log/poles/extraction_config.yaml` | 提取参数快照，GNSS 优化时用于自动重建 |
+| `Log/poles/gnss_optimization.yaml` | 自动重建使用的轨迹、点云归档和原结果备份路径 |
 | `Log/poles/detections.txt` | 每次检测的柱轴、半径、RMS、内点率、角度覆盖率等拟合质量指标 |
 | `Log/poles/landmarks.pcd` | 去重后的支柱中心点云，`intensity` 表示观测次数 |
 | `Log/poles/rail_vector_map.txt` | 左右轨顶三维控制点、线路切向、轨距和提取质量 |
-| `Log/poles/keyframe_XXXXXX_poles.pcd` | 每个支柱关键帧中通过细过滤的竖直支柱点 |
+| `Log/poles/poles.pcd` | 所有关键帧通过细过滤的支柱点，结束时汇总保存，由 `save_keyframe_clouds` 控制 |
+| `Log/poles/rails.pcd` | 所有关键帧中钢轨附近的实测激光点，保留输入分辨率；不插值、不作提取模块的体素降采样 |
 | `Log/poles_localization/localization_corrections.txt` | 二次运行中通过验收的 `POLE/RAIL` 原始修正、LIO 累计里程、匹配数和 RMS |
 | `Log/pole_localization/localization_tum.txt` | 不使用稠密地图时，由支柱修正与每帧 LIO 组合得到的完整轨迹 |
 | `Log/pole_localization/filtered_corrections.txt` | 纯支柱定位每次滤波更新的原始/滤波修正、创新、马氏距离和协方差 |
@@ -212,7 +219,7 @@ RANSAC 和最小二乘拟合截面圆；轴倾角、拟合半径、全点径向 
 次数、半径和 RMS。在线运行或希望边处理边看时使用：
 
 ```bash
-roslaunch bievr_lio_ros process_topics.launch rviz:=true
+roslaunch bievr_lio_ros mapping.launch
 ```
 
 离线 `process_bag` 通常很快结束，处理完成后推荐直接查看保存结果：
@@ -230,11 +237,14 @@ python3 scripts/visualize_poles.py --no-map --no-gui \
   --overview Log/poles/poles_overview.png
 ```
 
-襄阳铁路 bag 可直接使用 `xiangyang` 传感器配置，例如：
+襄阳铁路 bag 使用 `mapping.launch` 中已写入的 `xiangyang.yaml`。
+先启动建图节点，再在另一终端播放数据：
 
 ```bash
-roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
-  rosbag:="/mnt/e/Data/襄阳铁路数据-第二次数据/2026-01-13_襄阳金鹰重工_焦柳线_郜营-余家湖/20260113/bag20260113_1.bag"
+roslaunch bievr_lio_ros mapping.launch
+
+# 另一终端
+rosbag play "/mnt/e/Data/襄阳铁路数据-第二次数据/2026-01-13_襄阳金鹰重工_焦柳线_郜营-余家湖/20260113/bag20260113_1.bag"
 ```
 
 默认参数以约 10 Hz 的 Livox 数据为基准：正常行驶每 30 m 生成关键帧，至少
@@ -258,17 +268,81 @@ GICP。参数、初值要求和完整设计参见
 [`doc/pole_landmark_localization.md`](doc/pole_landmark_localization.md)。离线验证器
 `scripts/validate_pole_localization.py` 可对两次提取结果注入可控位置/航向误差。
 
-bag 含 `sensor_msgs/NavSatFix` 时，可先用 GTSAM 后端把 LIO 轨迹优化到局部 ENU：
+在线播放 bag 并随时停止时，`mapping.launch` 和 `process_topics.launch` 默认同时启动
+`gnss_recorder`，订阅 `/gnss` 并逐条刷新文件。先启动前端，再播放 bag：
 
 ```bash
-rosrun bievr_lio_ros gnss_optimize --bag data.bag \
+roslaunch bievr_lio_ros mapping.launch
+rosbag play --clock data.bag
+# 停止播放，再 Ctrl+C 停止前端以保存 LIO 轨迹，然后优化：
+rosrun bievr_lio_ros gnss_optimize --gnss_enu Log/gnss/gnss_enu.txt \
   --lio_trajectory Log/odometry_tum.txt --output_directory Log/gnss_optimization
 ```
 
-该工具是离线批优化：先读取完整 LIO 轨迹和 bag 内 GNSS，再执行 GTSAM LM；不是
-随每帧增量更新的实时 iSAM2 节点。GNSS 按时间插值约束相邻 LIO 位姿，并使用
+如需 ROS 使用 bag 时间，启动前设置 `rosparam set /use_sim_time true`。
+记录器使用 `NavSatFix.header.stamp`；前端与 GNSS 必须使用同一时间基准。
+在 `config/params.yaml` 配置 GNSS 话题和节点开关：
+
+```yaml
+gnss_recorder:
+  enable: True
+  gnss_topic: "/gnss"
+```
+
+`process_topics.launch` 的自定义 `params` 文件也会传给记录节点。
+关闭时设置 `enable: False`，节点直接退出，不创建记录文件。
+其余参数使用默认值：输出到项目的 `Log/gnss`，已有文件不覆盖；再次运行前请先移走上次记录。
+直接运行前端可另开终端启动记录器，读取同一份配置：
+
+```bash
+roslaunch bievr_lio_ros gnss_recorder.launch
+```
+
+使用 GeographicLib `LocalCartesian`（WGS84）转换，`/gnss` 或 `/gnss_pose` 首条有效位置为两者共用的固定 ENU 原点；
+也可设置记录节点私有参数 `origin_lla: [纬度, 经度, 椭球高]`，让多次记录共用原点。
+编译依赖 GeographicLib 开发库（Ubuntu：`sudo apt install libgeographiclib-dev`）。输出：
+
+- `gnss_raw.txt`：时间戳、经纬度、椭球高、status、service、协方差类型及完整 3×3 协方差；无效 Fix 也保留。
+- `gnss_enu.txt`：`timestamp east north up variance_e variance_n variance_u`，单位 m / m²；
+  含 `# origin_lla lat lon alt` 元数据，直接适配优化器 `--gnss_enu`。
+- `gnss_enu_tum.txt`：`timestamp east north up qx qy qz qw`；GNSS 无姿态，四元数为占位 `0 0 0 1`，不能作为姿态真值。
+
+记录节点还默认订阅 `/gnss_pose`（`geometry_msgs/PoseStamped`），按本数据集的
+`position.x=纬度(°)、y=经度(°)、z=椭球高(m)` 提取位置；不是普通米制 PoseStamped。
+同目录输出 `gnss_pose_raw.txt`、`gnss_pose_enu.txt`、`gnss_pose_enu_tum.txt`。
+原始文件保存时间戳、LLA 和消息中的四元数；ENU 文件使用与 `/gnss` 完全相同的原点，
+协方差列为默认 `[1, 1, 4] m²`（消息没有协方差，不是接收机报告的精度）。
+TUM 文件仅作为位置真值，姿态填 `0 0 0 1`，不将接收机原始姿态当作 ENU 姿态真值。
+无效经纬度仅保留原始行；只播放 `/gnss_pose` 时也能独立建立原点并记录。
+如需改话题可用 ROS remap `/gnss_pose:=/your/pose`，无需新增配置项。
+
+仅有效 Fix 写入 ENU，未知或非法协方差使用与原优化器一致的 `[1, 1, 4] m²`。
+暂停期间节点保持等待，已接收记录已刷新到文件；跳回旧时间或重新播放时应新建记录，避免重复时间段。
+前端复用 `gnss_recorder.enable` 开关，同时将每帧**已去畸变的 IMU/body 坐标系点云**、
+强度和纳秒时间戳保存到 `Log/gnss/scans.bin`（随 `map_save.path` 所在目录保存）。
+后台写盘队列有内存上限，磁盘跟不上时等待，不静默丢帧；正常退出会写完排队数据。
+已有 `scans.bin` 不覆盖，每次采集前将上一轮 GNSS 和点云归档一起移走。
+
+优化器只使用与 LIO 时间范围重叠的 GNSS，默认从 GNSS 文本同目录读取 `scans.bin`，
+按优化后的机体位姿变换逐帧点云，输出 `gnss_optimized_map.pcd`，保留强度并做体素降采样。
+点云已应用 LiDAR→IMU 外参和前端去畸变，不再重复处理。
+归档不在默认位置时指定 `--scans /path/to/scans.bin`。
+当前旧记录如果没有逐帧归档，需要重新播放采集；仅有累计 `map.pcd` 不能恢复逐帧轨迹修正。
+只优化轨迹时指定 `--skip-output-map`，launch 对应 `skip_output_map:=true`。
+
+通过 launch 加载现有优化参数：
+
+```bash
+roslaunch bievr_lio_ros gnss_optimize.launch \
+  gnss_enu:=/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/gnss/gnss_enu.txt \
+  lio_trajectory:=/home/zsq/slam/bievr-slam/src/BIEVR-LIO/Log/odometry_tum.txt
+```
+
+`gnss_optimize` 是离线批优化：读取已保存的 LIO 轨迹、GNSS 文本并执行 GTSAM LM，
+再读取逐帧点云归档重建 ENU 地图。原 `--bag` 输入已删除。
+GNSS 按时间插值约束相邻 LIO 位姿，并使用
 `p_antenna = p_body + R_body * lever_arm` 杆臂模型。可在
-`interfaces/ros1/launch/gnss_optimize.launch` 配置杆臂、协方差缩放/轴向标准差覆盖、
+`config/gnss_optimize.yaml` 配置点云地图、杆臂、协方差缩放/轴向标准差覆盖、
 Huber/Cauchy 鲁棒核以及第一轮优化后的卡方异常值剔除。铁路配置将
 `odom_neighbor_span` 设为 `3`，以加入参考 PGO 的多邻接 LIO 边；这些组合边与相邻
 边相关，如果数据噪声较大或希望更保守，可改回 `1`。
@@ -277,22 +351,59 @@ Huber/Cauchy 鲁棒核以及第一轮优化后的卡方异常值剔除。铁路�
 选取一个控制位姿；优化后对 `map<-odom` 修正做平滑插值，再作用到全部原始 LIO
 位姿。将 `control_pose_interval_s` 设为 `0` 可恢复逐帧优化。
 
-节点还会读取 `pointcloud_topic`（默认 `/livox/lidar`），按 GNSS 优化后的 LIO
-位姿重新累积点云，并输出带强度的 `gnss_optimized_map.pcd`。地图采用体素降采样，
-默认分辨率为 `0.15 m`，并根据 Livox 点内时间在扫描首尾优化位姿之间做 32 段
-运动补偿；可通过 `output_map`、`map_voxel_resolution_m` 和距离门限参数调整。
-当前襄阳传感器配置的 LiDAR→IMU 外参为单位阵；其他设备需要在地图重建代码中补入
-对应的 `T_I_L` 外参，否则点云会有固定外参偏移。
+优化结束会在同一输出目录自动生成 GNSS 对比报告（`--skip-output-map` 时也生成）：
 
-首次支柱建图把输出的 `gnss_optimized_tum.txt` 填入
-`pole_extraction.mapping_trajectory_path`；第二次支柱定位必须清空该项，运行时
+- `evaluation_metrics.txt` / `.csv` / `.json`：原始 LIO 与优化后 LIO 的 X/Y/Z、水平、
+  三维位置误差 RMSE 和 MAX，单位 m；轴向 MAX 为最大绝对误差，水平/三维 MAX 为最大误差范数。
+- `trajectory_xyz.png`：GNSS、LIO、优化后 LIO 的 X/Y/Z 随时间变化曲线。
+- `position_error_xyz.png`：两组估计相对 GNSS 的 X/Y/Z 有符号误差。
+- `evaluation_samples.csv`：同一批 GNSS 时间戳上的位置及逐轴误差，便于复核。
+- `lio_aligned_enu_tum.txt`：原始 LIO 使用后端**优化前**的初始 ENU 变换转换后的轨迹。
+
+以 GNSS 天线位置为参考，应用配置中的天线杆臂，按 GNSS 时间戳插值 LIO；
+跨越大于 `2 * max_time_gap_s` 的轨迹缺口不插值。两组使用相同样本、单位尺度和原始时间，
+优化结果不再重新对齐；全部匹配到的有效 GNSS 都参与报告，包括后端判为异常的 Fix。
+这些数值是相对本次参与优化的 GNSS 的拟合误差。绘图依赖 `python3-numpy`、
+`python3-matplotlib` 和 `python3-yaml`。
+
+稠密地图默认体素分辨率 `0.15 m`，通过 `config/gnss_optimize.yaml` 中的 `output_map`、
+`map_voxel_resolution_m` 和距离门限参数调整。使用 `--skip-output-map` 时只输出轨迹，
+`summary.yaml` 中的 `optimized_map` 保持为空。
+
+优化完成后可将局部 ENU 轨迹叠加到真实道路/铁路地图上：
+
+```bash
+python3 scripts/plot_gnss_trajectory_osm.py \
+  --trajectory Log/gnss_control05_deskew_validation_20260909/gnss_optimized_tum.txt \
+  --summary Log/gnss_control05_deskew_validation_20260909/summary.yaml \
+  --output Log/gnss_control05_deskew_validation_20260909/gnss_optimized_trajectory_osm.png \
+  --zoom 14
+```
+
+默认底图使用 OpenStreetMap 瓦片并显示版权标注；瓦片会缓存到本地。无网络时加
+`--no-basemap`，仍会输出 ENU 轨迹图。OSM 标准瓦片适合少量人工查看，不建议批量
+下载大范围离线地图；需要大规模离线处理时应改用自建或明确允许离线使用的地图服务。
+
+GNSS 优化默认会从 `scans.bin` 和优化轨迹自动重建已有的 `Log/poles/`，
+包括支柱地标、支柱点云、轨道矢量及实测轨道点云，不必再次播放 bag。
+旧目录保留为 `poles.before_gnss_*`，新目录记录 `gnss_optimization.yaml`。
+首次提取现在也会保存 `extraction_config.yaml` 供重建复用；旧结果没有快照时
+回退到 `config/params.yaml`，可用 `--pole_params_file` 指定原提取参数。
+默认支柱目录是 LIO 轨迹文件同级的 `poles/`，可用 `--poles_directory` 修改；
+`--skip-poles` 跳过自动重建，`--skip-output-map` 只跳过稠密地图。
+如果尚无支柱地图，可以将优化轨迹填入 `pole_extraction.mapping_trajectory_path`
+后再首次提取。第二次支柱定位必须清空该项，运行时
 只使用 LIO 和 `landmarks.txt`。节点还输出含完整初始四元数的
 `initial_correction.yaml`，完整流程和实测结果见上述设计文档。
 
 可选的 `rail_extraction` 会复用同一批支柱关键帧，按横断面显著性、软轨距和
-连续性提取左右轨顶，将稀疏三维折线保存为 `rail_vector_map.txt`。第二次运行加载
-该矢量地图，以鲁棒点到轨面残差补充 `z/pitch` 约束；支柱继续负责 `x/y/yaw`，
-查询阶段仍不加载 GNSS 或稠密点云。组合模式使用：
+连续性提取左右轨顶，将稀疏三维折线保存为 `rail_vector_map.txt`。定位时会把同一
+段内相邻控制点连接成三维线段，将当前轨道连续投影到地图线段，而不是与离散采样
+点直接做最近邻匹配。第二次运行加载
+该矢量地图，以鲁棒线残差约束横向、`z/roll/pitch/yaw`，但明确不约束沿轨方向
+平移；支柱继续提供绝对 `x/y/yaw` 锚点。为避免平行股道歧义，支柱尚未确认全局
+位置时，轨道平面解不会写入支柱关联初值或 GTSAM 图。查询阶段仍不加载 GNSS 或
+稠密点云。组合模式使用：
 
 ```bash
 roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
@@ -307,8 +418,8 @@ roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
 
 #### 推荐的铁路数据完整流程
 
-以下命令以襄阳铁路数据为例。路径和输出目录可以替换，但建图阶段的
-`mapping_trajectory_path` 必须填写 GNSS 优化后的 TUM 轨迹，重定位阶段必须清空。
+以下命令以襄阳铁路数据为例。路径和输出目录可以替换。GNSS 优化会自动更新已有
+支柱/轨道地图；手动首次提取时才需要填写 `mapping_trajectory_path`，重定位阶段必须清空。
 
 ```bash
 source /opt/ros/noetic/setup.bash
@@ -320,18 +431,32 @@ BAG="/mnt/e/Data/襄阳铁路数据-第二次数据/2026-01-13_襄阳金鹰重�
 roscore
 
 # 终端 2：继续执行下面的命令
-# 1. 先运行 LIO，得到 Log/odometry_tum.txt
-rosrun bievr_lio_ros process_bag \
-  --sensor_config_file config/sensor_configs/xiangyang.yaml \
-  --params_file config/params.yaml --bag "$BAG"
+# 1. 先启动在线前端及 GNSS 记录器（另开终端播放，任意时刻停止后关闭前端）
+roslaunch bievr_lio_ros mapping.launch
+# 另一个终端：rosbag play --clock "$BAG"
 
-# 2. 使用 /gnss 建立 GTSAM 优化轨迹和初始 map<-odom 变换
-rosrun bievr_lio_ros gnss_optimize --bag "$BAG" \
+# 2. 从本次保存的 GNSS、LIO 和逐帧点云建立优化轨迹、ENU 地图和初始变换
+rosrun bievr_lio_ros gnss_optimize --gnss_enu Log/gnss/gnss_enu.txt \
   --lio_trajectory Log/odometry_tum.txt \
   --output_directory Log/gnss_optimization
 ```
 
-首次提取地图时，在 `config/params.yaml` 中设置：
+GNSS 初始对齐使用首个有效 GNSS/LIO 匹配点开始的前 45 秒，估计统一的 yaw 和
+XYZ 平移，再应用于整条轨迹；Z 平移取这段天线高度差的中位数。全程 GNSS 仍参与
+后续因子图优化。通过 `config/gnss_optimize.yaml` 中的
+`initial_alignment_duration_s` 和 `initial_alignment_min_baseline_m` 调整窗口和
+最小水平基线（默认 5 m）。该 YAML 由 `gnss_optimize.launch` 加载；直接运行上面的
+`rosrun` 命令使用内置默认值。窗口内少于三个匹配点或水平运动不足时会报错，应调整
+窗口或检查数据。`summary.yaml` 记录实际对齐点数、相对 LIO 起点的时间偏移和跨度；
+`initial_3d_rmse_m` 仍是初始对齐后的全程残差，并非起点误差。
+
+`initial_outlier_gate_m` 只对上述初始对齐窗口内的 GNSS 生效，设为 `0` 可关闭。
+窗口之后的 GNSS 不再因初始 LIO 的累计漂移被提前删除，而是进入鲁棒优化，再由
+`postfit_outlier_chi2` 检查优化后的残差。`summary.yaml` 中的
+`initial_outlier_gate_scope: alignment_window` 表示采用此规则。
+
+如果 GNSS 优化前已经生成 `Log/poles/`，上一步会自动更新其中结果，无需重复回放。
+只有首次运行时未开启提取、尚无支柱地图，才需要在 `config/params.yaml` 中设置：
 
 ```yaml
 pole_extraction:
@@ -363,11 +488,60 @@ roslaunch bievr_lio_ros process_bag.launch \
 `gnss_optimize` 输出的 `initial_correction.yaml` 内容作为最后一层参数，或者通过
 RViz `/initialpose` 提供初始位姿。
 
-GNSS 后端使用 GTSAM 优化 LIO 轨迹；轨道在线定位使用鲁棒小量最小二乘和独立的
-`z/roll/pitch` 滤波器，支柱在线定位使用 Hungarian 关联和 Huber `SE(2)`。轨道并
-不是稠密点云匹配的替代品，而是稀疏支柱地图模式中的连续高程/坡度约束。
+轨道滤波在首次有效观测时允许建立大范围高程初值；正常跟踪仍使用独立的
+`max_innovation_z_m`、`max_innovation_tilt_deg` 和 `rail_mahalanobis_gate` 门限。若超过
+`pole_localization.rail_rebootstrap_gap_m`（默认 100 m）没有接受轨道约束，下一条
+通过匹配数、基线和 RMS 检验的轨道观测会重新捕获竖直状态。姿态修正绕当前轨道
+窗口锚点实施，并同步补偿平移，避免在长距离 odom 坐标上由小 pitch 产生水平跳变。
+
+连续 bag2–bag4 的同源闭环验证共 15946 个 LIO 位姿、约 1594.4 s。GNSS 图使用
+6378 个位置因子；稀疏地图含 466 根支柱和 32697 个轨道采样点。第二次运行明确为
+`POLE_MAP_ONLY (no dense map or GICP)`，最终支柱滤波接受 408/408，轨道滤波接受
+401/413；对 GNSS 优化参考的水平 RMSE 为 0.588 m、竖直 RMSE 为 0.947 m、yaw
+RMSE 为 0.158 deg。由于建图、定位和评估使用同一组数据，这些数值表示流程一致性，
+不能替代独立往返数据或测量控制点的绝对精度评估。
+
+另外使用一个常驻 `process_topics` 节点和一次 `rosbag play --clock --rate=1.0`
+连续播放 bag2–bag4，完成了 1594.8 s 的在线回调测试。节点收到 15946 帧，处理 545
+个关键帧且 `dropped_keyframes: 0`；在线生成的 12522 个已定位位姿与上述离线连续
+处理结果逐点一致。测试输出、统计和误差图保存在
+`Log/online_bag2_bag4_20260910/`。
+
+另一次论文用在线实验从 bag1 的 150 s 冷启动，以一个常驻 `process_topics` 和
+一次 `rosbag play --clock --rate=1.0` 连续播放 bag1--bag3，共处理 1493.3 s、
+12622.5 m。建图得到 472 根支柱和 32141 个轨道矢量采样，522 个关键帧无丢弃；
+查询阶段只加载这两种稀疏地图，不读取 GNSS、不加载稠密 PCD、不运行 GICP。
+相对同批数据的 GNSS--LIO GTSAM 参考轨迹，组合定位水平 RMSE 为 0.269 m、垂向
+RMSE 为 0.396 m、yaw RMSE 为 0.087 deg；完整报告、分 bag 指标和论文 PDF/PNG
+图位于 `Log/paper_online_bag1_150_bag3_20260910/report/`。该结果属于同源闭环验证，
+不是独立数据或测量真值实验。
+
+GNSS 后端使用 GTSAM 优化 LIO 轨迹。稀疏定位前端仍使用 Hungarian + Huber
+`SE(2)` 完成支柱关联，并用鲁棒小量最小二乘拟合轨道；通过几何和创新门控后，每个
+提取关键帧建立一个 GTSAM `Pose3`，相邻节点由 LIO `BetweenFactor` 连接。支柱因子
+只约束 `x/y/yaw`；轨道自定义 5DoF 因子约束横向、`z/roll/pitch/yaw`，其残差空间
+不含沿轨平移。优化后的关键帧修正在稠密 LIO 轨迹上插值。轨道不是稠密点云匹配的
+替代品，而是稀疏支柱地图模式中的连续横向、高程和姿态约束。
 
 #### 评估和可视化
+
+论文风格的轨迹、误差、稀疏地图、匹配质量和门限消融图可统一生成：
+
+```bash
+python3 scripts/generate_sparse_localization_paper_figures.py \
+  --lio Log/experiment/localization/odometry_tum.txt \
+  --localized Log/experiment/localization/localization_tum.txt \
+  --baseline-localized Log/experiment/localization_baseline/localization_tum.txt \
+  --reference Log/experiment/gnss/gnss_optimized_tum.txt \
+  --poles Log/experiment/mapping/sparse_map/landmarks.txt \
+  --rails Log/experiment/mapping/sparse_map/rail_vector_map.txt \
+  --corrections Log/experiment/localization/observations/localization_corrections.txt \
+  --output-directory Log/experiment/report/figures
+```
+
+每张图同时输出矢量 PDF 和 300 dpi PNG，数值保存在
+`comparison_metrics.json`；可重复提供 `--boundary BAG_END_TIMESTAMP` 计算并标记
+各 bag 区间。
 
 相对于参考 TUM 轨迹计算水平、垂直、三维、yaw、roll 和 pitch 误差：
 
@@ -376,6 +550,16 @@ python3 scripts/evaluate_tum_against_reference.py \
   --estimate Log/pole_rail_localization/localization_tum.txt \
   --reference Log/gnss_optimization/gnss_optimized_tum.txt \
   --output Log/pole_rail_localization/metrics.json
+```
+
+绘制沿线水平/高程误差并标记分包边界：
+
+```bash
+python3 scripts/plot_localization_errors.py \
+  --estimate Log/pole_rail_localization/localization_tum.txt \
+  --reference Log/gnss_optimization/gnss_optimized_tum.txt \
+  --boundary 1768270776.931093 --boundary 1768271314.443376 \
+  --output Log/pole_rail_localization/localization_errors.png
 ```
 
 查看支柱和轨道矢量地图，并导出 CloudCompare/MeshLab 可读的 PLY：
@@ -402,8 +586,7 @@ roslaunch bievr_lio_ros process_bag.launch sensor_config:=xiangyang \
 只使用 LIO 和 `landmarks.txt` 时，使用独立的纯支柱定位模式：
 
 ```bash
-roslaunch bievr_lio_ros pole_localization.launch \
-  sensor_config:=xiangyang rviz:=true
+roslaunch bievr_lio_ros pole_localization.launch
 ```
 
 离线复放使用：
@@ -435,9 +618,9 @@ launch 文件只负责选择配置文件、数据和 RViz，不会覆盖算法�
 - 支柱 + 轨道矢量定位：在纯支柱模式基础上设置 `rail_extraction.enable: True`，
   或叠加 `params_pole_rail_localization.yaml`
 
-The launch files contain editable defaults for the sensor config, parameter file,
-bag path and RViz switch. Change those values at the top of the relevant launch
-file, then use the commands below without additional terminal arguments.
+For topic-based mapping, `mapping.launch` contains the sensor-config and
+parameter-file paths relative to `$(find bievr_lio_ros)`. Edit those paths in the
+launch file; the bag path is intentionally not stored there.
 
 Algorithm settings are not overridden by launch files. Use `config/params.yaml`
 as the base and select exactly one localization overlay when relocalizing:
@@ -451,16 +634,16 @@ as the base and select exactly one localization overlay when relocalizing:
 - Pole-map localization (`config/params_pole_localization.yaml`): `localization.enable: False`,
   `pole_extraction.localization_enable: True`, `pole_localization.enable: True`
 
-Process live topics:
+Start topic-based mapping (also used with `rosbag play`):
 
 ```bash
-roslaunch bievr_lio_ros process_topics.launch
+roslaunch bievr_lio_ros mapping.launch
 ```
 
-Replay a rosbag:
+In a second sourced terminal, replay the rosbag:
 
 ```bash
-roslaunch bievr_lio_ros process_bag.launch
+rosbag play /absolute/path/to/data.bag
 ```
 
 ## Configuration
@@ -475,10 +658,11 @@ The configuration is split in two files:
   the LiDAR and IMU topic names, the LiDAR→IMU extrinsic calibration, and the
   LiDAR min/max range.
 
-Set the `sensor_config` default near the top of the launch file. A short name such
-as `ncd` resolves to `config/sensor_configs/ncd.yaml`; an absolute path is used
-verbatim, so configs may also live outside the package. The `params` default works
-the same way and selects a file under `config/` (the default is `params.yaml`).
+Set the `--sensor_config_file` and `--params_file` paths directly in
+`interfaces/ros1/launch/mapping.launch`, `localization.launch`, and
+`pole_localization.launch`. They use `$(find bievr_lio_ros)` so the launch files
+do not depend on the workspace's absolute path. Other specialized launch files
+may still expose configuration names as launch arguments for offline evaluation.
 
 <details>
 <summary><b>Provided datasets</b></summary>

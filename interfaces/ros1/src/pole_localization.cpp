@@ -59,6 +59,23 @@ uint64_t secondsToNanoseconds(double seconds) {
   return static_cast<uint64_t>(value);
 }
 
+SparseLocalizationGraph::Config graphConfig(
+    const PoleLocalizationConfig& config) {
+  SparseLocalizationGraph::Config graph;
+  graph.odom_xy_sigma_m_per_sqrt_m =
+      config.process_noise_xy_m_per_sqrt_m;
+  graph.odom_z_sigma_m_per_sqrt_m = config.process_noise_z_m_per_sqrt_m;
+  graph.odom_yaw_sigma_deg_per_sqrt_m =
+      config.process_noise_yaw_deg_per_sqrt_m;
+  graph.odom_tilt_sigma_deg_per_sqrt_m =
+      config.process_noise_tilt_deg_per_sqrt_m;
+  graph.prior_translation_sigma_m =
+      config.factor_graph_prior_translation_sigma_m;
+  graph.prior_rotation_sigma_deg = config.factor_graph_prior_rotation_sigma_deg;
+  graph.robust_huber_delta = config.factor_graph_huber_delta;
+  return graph;
+}
+
 }  // namespace
 
 bool loadPoleLocalizationConfig(const std::vector<std::string>& yaml_paths,
@@ -82,6 +99,16 @@ bool loadPoleLocalizationConfig(const std::vector<std::string>& yaml_paths,
   config.output_directory =
       yaml.get<std::string>(section, "output_directory", config.output_directory);
   config.filter_enable = yaml.get<bool>(section, "filter_enable", config.filter_enable);
+  config.factor_graph_enable = yaml.get<bool>(
+      section, "factor_graph_enable", config.factor_graph_enable);
+  config.factor_graph_huber_delta = yaml.get<double>(
+      section, "factor_graph_huber_delta", config.factor_graph_huber_delta);
+  config.factor_graph_prior_translation_sigma_m = yaml.get<double>(
+      section, "factor_graph_prior_translation_sigma_m",
+      config.factor_graph_prior_translation_sigma_m);
+  config.factor_graph_prior_rotation_sigma_deg = yaml.get<double>(
+      section, "factor_graph_prior_rotation_sigma_deg",
+      config.factor_graph_prior_rotation_sigma_deg);
   config.process_noise_xy_m_per_sqrt_m = yaml.get<double>(
       section, "process_noise_xy_m_per_sqrt_m", config.process_noise_xy_m_per_sqrt_m);
   config.process_noise_yaw_deg_per_sqrt_m = yaml.get<double>(
@@ -111,6 +138,10 @@ bool loadPoleLocalizationConfig(const std::vector<std::string>& yaml_paths,
       section, "max_innovation_z_m", config.max_innovation_z_m);
   config.max_innovation_tilt_deg = yaml.get<double>(
       section, "max_innovation_tilt_deg", config.max_innovation_tilt_deg);
+  config.rail_mahalanobis_gate = yaml.get<double>(
+      section, "rail_mahalanobis_gate", config.rail_mahalanobis_gate);
+  config.rail_rebootstrap_gap_m = yaml.get<double>(
+      section, "rail_rebootstrap_gap_m", config.rail_rebootstrap_gap_m);
   config.initial_confirmations =
       yaml.get<int>(section, "initial_confirmations", config.initial_confirmations);
   config.recovery_confirmations =
@@ -133,6 +164,9 @@ bool loadPoleLocalizationConfig(const std::vector<std::string>& yaml_paths,
       config.process_noise_yaw_deg_per_sqrt_m <= 0.0 ||
       config.process_noise_z_m_per_sqrt_m <= 0.0 ||
       config.process_noise_tilt_deg_per_sqrt_m <= 0.0 ||
+      config.factor_graph_huber_delta <= 0.0 ||
+      config.factor_graph_prior_translation_sigma_m <= 0.0 ||
+      config.factor_graph_prior_rotation_sigma_deg <= 0.0 ||
       config.measurement_xy_floor_m <= 0.0 ||
       config.measurement_yaw_floor_deg <= 0.0 ||
       config.measurement_z_floor_m <= 0.0 ||
@@ -140,6 +174,8 @@ bool loadPoleLocalizationConfig(const std::vector<std::string>& yaml_paths,
       config.max_innovation_translation_m <= 0.0 ||
       config.max_innovation_yaw_deg <= 0.0 || config.initial_confirmations <= 0 ||
       config.max_innovation_z_m <= 0.0 || config.max_innovation_tilt_deg <= 0.0 ||
+      config.rail_mahalanobis_gate <= 0.0 ||
+      config.rail_rebootstrap_gap_m <= 0.0 ||
       config.recovery_confirmations <= 0 || config.degraded_after_distance_m <= 0.0 ||
       config.lost_after_distance_m <= config.degraded_after_distance_m ||
       config.path_publish_frequency <= 0.0 || max_poses < 0 || buffer_frames <= 0) {
@@ -174,7 +210,11 @@ PoleLocalization::PoleLocalization(ros::NodeHandle& nh,
                                    const std::shared_ptr<Pipeline>& pipeline,
                                    PoleLocalizationConfig config,
                                    const std::string& topic_prefix)
-    : config_(std::move(config)), odom_frame_(pipeline->config().map_frame),
+    : config_(std::move(config)),
+      graph_(config_.factor_graph_enable
+                 ? std::make_unique<SparseLocalizationGraph>(graphConfig(config_))
+                 : nullptr),
+      odom_frame_(pipeline->config().map_frame),
       body_frame_(pipeline->config().body_frame) {
   odom_pub_ = nh.advertise<nav_msgs::Odometry>(topic_prefix + "/loc/odom", 10, true);
   path_pub_ = nh.advertise<nav_msgs::Path>(topic_prefix + "/loc/path", 1, true);
@@ -200,14 +240,60 @@ PoleLocalization::Stats PoleLocalization::stats() const {
 }
 
 Transform PoleLocalization::correctionLocked() const {
+  if (graph_ && graph_->initialized()) {
+    const uint64_t stamp = have_odom_ ? latest_odom_stamp_ : 0;
+    if (const auto correction = graph_->correctionAt(stamp)) return *correction;
+  }
   return Transform(rpyRotation(vertical_state_.y(), vertical_state_.z(), state_.z()),
                    V3(state_.x(), state_.y(), vertical_state_.x()));
+}
+
+void PoleLocalization::syncStateFromCorrectionLocked(
+    const Transform& correction) {
+  const Eigen::Vector3d rpy = rpyOf(correction.rotation());
+  state_ = Eigen::Vector3d(correction.translation().x(),
+                           correction.translation().y(), rpy.z());
+  vertical_state_ = Eigen::Vector3d(correction.translation().z(),
+                                    rpy.x(), rpy.y());
+}
+
+void PoleLocalization::rewriteTrajectoryFromGraphLocked() {
+  if (!graph_ || !graph_->initialized()) return;
+  for (size_t index = 0; index < localized_odometry_.size(); ++index) {
+    const BufferedOdometry& odometry = localized_odometry_[index];
+    const auto correction = graph_->correctionAt(odometry.stamp);
+    if (!correction) continue;
+    trajectory_.poses[index].pose =
+        Transform(Eigen::Isometry3d(*correction * odometry.pose));
+  }
+  for (StampedPose& pose : path_.poses) {
+    const auto odometry = std::lower_bound(
+        localized_odometry_.begin(), localized_odometry_.end(), pose.stamp,
+        [](const BufferedOdometry& candidate, uint64_t stamp) {
+          return candidate.stamp < stamp;
+        });
+    if (odometry == localized_odometry_.end() || odometry->stamp != pose.stamp) continue;
+    const auto correction = graph_->correctionAt(pose.stamp);
+    if (correction) {
+      pose.pose = Transform(Eigen::Isometry3d(*correction * odometry->pose));
+    }
+  }
 }
 
 std::optional<Transform> PoleLocalization::correction() const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (!initialized_) return std::nullopt;
   return correctionLocked();
+}
+
+void PoleLocalization::addKeyframe(uint64_t stamp,
+                                   const Transform& T_odom_body,
+                                   double /*odom_distance_m*/) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!graph_) return;
+  if (!graph_->addKeyframe(stamp, T_odom_body)) {
+    LOG(W, "Ignored out-of-order sparse-localization keyframe at " << stamp << ".");
+  }
 }
 
 void PoleLocalization::publishStatus(Status status) {
@@ -243,6 +329,7 @@ void PoleLocalization::onInitialPose(
     fixed_z_ = seed.translation().z();
     const Eigen::Vector3d rpy = rpyOf(seed.rotation());
     vertical_state_ = Eigen::Vector3d(seed.translation().z(), rpy.x(), rpy.y());
+    if (graph_) graph_->setInitialCorrection(seed);
 
     const auto& input_covariance = message->pose.covariance;
     const double xy_floor_sq =
@@ -266,6 +353,8 @@ void PoleLocalization::onInitialPose(
     filter_distance_m_ = odom_distance_m_;
     have_vertical_filter_distance_ = true;
     vertical_filter_distance_m_ = odom_distance_m_;
+    have_rail_vertical_fix_ = false;
+    last_rail_fix_distance_m_ = odom_distance_m_;
     have_accepted_measurement_distance_ = false;
     confirmations_ = 0;
     distance_since_measurement_ = 0.0;
@@ -345,7 +434,17 @@ void PoleLocalization::addPoleCorrection(const PoleLocalizationCorrection& raw) 
       confirmations_ = 1;
       accepted = true;
     } else {
-      Eigen::Vector3d innovation = measurement - state_;
+      // Evaluate translation innovation at the observed pole-window anchor.
+      // Raw map<-odom tx/ty are coordinate-origin dependent and therefore are
+      // unsuitable filter innovations on a long railway trajectory.
+      const Transform current_correction = correctionLocked();
+      const double filtered_yaw = yawOf(current_correction.rotation());
+      const V3 raw_anchor_map = raw.T_map_odom * raw.correction_anchor_odom;
+      const V3 filtered_anchor_map =
+          current_correction * raw.correction_anchor_odom;
+      Eigen::Vector3d innovation(raw_anchor_map.x() - filtered_anchor_map.x(),
+                                 raw_anchor_map.y() - filtered_anchor_map.y(),
+                                 raw_yaw - filtered_yaw);
       innovation.z() = wrapAngle(innovation.z());
       stats_.last_innovation_m = innovation.head<2>().norm();
       stats_.last_innovation_yaw_deg = std::abs(innovation.z()) * kRadiansToDegrees;
@@ -362,8 +461,16 @@ void PoleLocalization::addPoleCorrection(const PoleLocalizationCorrection& raw) 
         if (config_.filter_enable) {
           const Eigen::Matrix3d gain =
               covariance_ * decomposition.solve(Eigen::Matrix3d::Identity());
-          state_ += gain * innovation;
-          state_.z() = wrapAngle(state_.z());
+          const Eigen::Vector3d update = gain * innovation;
+          const double updated_yaw = wrapAngle(filtered_yaw + update.z());
+          const Eigen::Vector2d updated_anchor =
+              filtered_anchor_map.head<2>() + update.head<2>();
+          const Rotation updated_rotation =
+              rpyRotation(vertical_state_.y(), vertical_state_.z(), updated_yaw);
+          const V3 rotated_anchor = updated_rotation * raw.correction_anchor_odom;
+          state_.x() = updated_anchor.x() - rotated_anchor.x();
+          state_.y() = updated_anchor.y() - rotated_anchor.y();
+          state_.z() = updated_yaw;
           const Eigen::Matrix3d identity = Eigen::Matrix3d::Identity();
           const Eigen::Matrix3d residual = identity - gain;
           covariance_ = residual * covariance_ * residual.transpose() +
@@ -381,6 +488,18 @@ void PoleLocalization::addPoleCorrection(const PoleLocalizationCorrection& raw) 
                    << stats_.last_innovation_m << " m / "
                    << stats_.last_innovation_yaw_deg << " deg, Mahalanobis "
                    << mahalanobis << ".");
+      }
+    }
+
+    if (accepted && graph_) {
+      if (graph_->addPlanarMeasurement(raw.stamp, raw.T_map_odom, xy_sigma,
+                                       yaw_sigma)) {
+        if (const auto optimized = graph_->correctionAt(raw.stamp)) {
+          syncStateFromCorrectionLocked(*optimized);
+        }
+      } else {
+        LOG(W, "Could not attach pole factor to keyframe at " << raw.stamp
+                                                                << ".");
       }
     }
 
@@ -439,28 +558,34 @@ void PoleLocalization::addPoleCorrection(const PoleLocalizationCorrection& raw) 
                                    status_ == Status::Degraded ||
                                    status_ == Status::Lost;
     if (accepted && has_confirmed_fix) {
-      // Apply a delayed correction at its actual sensor timestamp. Corrections
-      // arrive in keyframe order, so each pass only replaces the trajectory
-      // tail governed by the new map->odom estimate.
-      const auto begin = std::lower_bound(
-          localized_odometry_.begin(), localized_odometry_.end(), raw.stamp,
-          [](const BufferedOdometry& odometry, uint64_t stamp) {
-            return odometry.stamp < stamp;
-          });
-      for (auto iterator = begin; iterator != localized_odometry_.end(); ++iterator) {
-        const size_t index = static_cast<size_t>(iterator - localized_odometry_.begin());
-        trajectory_.poses[index].pose =
-            Transform(Eigen::Isometry3d(filtered * iterator->pose));
-      }
-      for (StampedPose& pose : path_.poses) {
-        if (pose.stamp < raw.stamp) continue;
-        const auto odometry = std::lower_bound(
-            localized_odometry_.begin(), localized_odometry_.end(), pose.stamp,
-            [](const BufferedOdometry& candidate, uint64_t stamp) {
-              return candidate.stamp < stamp;
+      if (graph_ && graph_->initialized()) {
+        rewriteTrajectoryFromGraphLocked();
+      } else {
+        // Apply a delayed correction at its actual sensor timestamp. Corrections
+        // arrive in keyframe order, so each pass only replaces the trajectory
+        // tail governed by the new map->odom estimate.
+        const auto begin = std::lower_bound(
+            localized_odometry_.begin(), localized_odometry_.end(), raw.stamp,
+            [](const BufferedOdometry& odometry, uint64_t stamp) {
+              return odometry.stamp < stamp;
             });
-        if (odometry != localized_odometry_.end() && odometry->stamp == pose.stamp) {
-          pose.pose = Transform(Eigen::Isometry3d(filtered * odometry->pose));
+        for (auto iterator = begin; iterator != localized_odometry_.end(); ++iterator) {
+          const size_t index =
+              static_cast<size_t>(iterator - localized_odometry_.begin());
+          trajectory_.poses[index].pose =
+              Transform(Eigen::Isometry3d(filtered * iterator->pose));
+        }
+        for (StampedPose& pose : path_.poses) {
+          if (pose.stamp < raw.stamp) continue;
+          const auto odometry = std::lower_bound(
+              localized_odometry_.begin(), localized_odometry_.end(), pose.stamp,
+              [](const BufferedOdometry& candidate, uint64_t stamp) {
+                return candidate.stamp < stamp;
+              });
+          if (odometry != localized_odometry_.end() &&
+              odometry->stamp == pose.stamp) {
+            pose.pose = Transform(Eigen::Isometry3d(filtered * odometry->pose));
+          }
         }
       }
     }
@@ -551,6 +676,12 @@ void PoleLocalization::addRailCorrection(
     const double tilt_sigma = std::max(
         config_.measurement_tilt_floor_deg * kDegreesToRadians,
         raw.rms / std::max(raw.baseline, 1.0));
+    const double cross_track_sigma = std::max(
+        config_.measurement_xy_floor_m,
+        raw.planar_rms / quality);
+    const double rail_yaw_sigma = std::max(
+        config_.measurement_yaw_floor_deg * kDegreesToRadians,
+        raw.planar_rms / std::max(raw.baseline, 1.0));
     Eigen::Matrix3d measurement_covariance = Eigen::Vector3d(
         z_sigma * z_sigma, tilt_sigma * tilt_sigma,
         tilt_sigma * tilt_sigma).asDiagonal();
@@ -573,7 +704,14 @@ void PoleLocalization::addRailCorrection(
     vertical_filter_distance_m_ =
         std::max(vertical_filter_distance_m_, raw.odom_distance_m);
 
-    Eigen::Vector3d innovation = measurement - vertical_state_;
+    const Transform current_correction = correctionLocked();
+    const Eigen::Vector3d current_rpy = rpyOf(current_correction.rotation());
+    const V3 raw_anchor_map = raw.T_map_odom * raw.correction_anchor_odom;
+    const V3 filtered_anchor_map =
+        current_correction * raw.correction_anchor_odom;
+    Eigen::Vector3d innovation(raw_anchor_map.z() - filtered_anchor_map.z(),
+                               measurement.y() - current_rpy.x(),
+                               measurement.z() - current_rpy.y());
     innovation.y() = wrapAngle(innovation.y());
     innovation.z() = wrapAngle(innovation.z());
     stats_.last_innovation_z_m = std::abs(innovation.x());
@@ -585,15 +723,88 @@ void PoleLocalization::addRailCorrection(
     if (decomposition.info() == Eigen::Success) {
       mahalanobis = innovation.dot(decomposition.solve(innovation));
     }
-    if (stats_.last_innovation_z_m <= config_.max_innovation_z_m &&
+    const bool rebootstrap =
+        !have_rail_vertical_fix_ ||
+        raw.odom_distance_m - last_rail_fix_distance_m_ >=
+            config_.rail_rebootstrap_gap_m;
+    if (rebootstrap) {
+      // The first valid rail fit establishes height/tilt at its local anchor.
+      // Do not compare it against the rigid map seed: that seed has no model
+      // for the height drift accumulated before rail coverage begins.
+      const double updated_roll = raw.constrain_roll ? measurement.y()
+                                                     : current_rpy.x();
+      const double updated_pitch = raw.constrain_pitch ? measurement.z()
+                                                       : current_rpy.y();
+      const Rotation updated_rotation =
+          rpyRotation(updated_roll, updated_pitch, current_rpy.z());
+      const V3 rotated_anchor = updated_rotation * raw.correction_anchor_odom;
+      // Tilt is observed at this rail window, not at the odom origin. Keep the
+      // current horizontal anchor fixed here so vertical rebootstrap cannot
+      // leak the rail's ambiguous cross-track/yaw solution into x/y before a
+      // pole fix has identified the correct track. Once initialized, the
+      // graph's RailPoseFactor applies the gated cross-track constraint.
+      state_.x() = filtered_anchor_map.x() - rotated_anchor.x();
+      state_.y() = filtered_anchor_map.y() - rotated_anchor.y();
+      vertical_state_.x() = raw_anchor_map.z() - rotated_anchor.z();
+      vertical_state_.y() = updated_roll;
+      vertical_state_.z() = updated_pitch;
+      vertical_covariance_ = measurement_covariance;
+      have_rail_vertical_fix_ = true;
+      last_rail_fix_distance_m_ = raw.odom_distance_m;
+      accepted = true;
+      ++stats_.rail_accepted;
+      const bool allow_rail_graph =
+          status_ == Status::Tracking || status_ == Status::Degraded ||
+          status_ == Status::Lost;
+      if (graph_ && allow_rail_graph) {
+        const double roll_sigma = raw.constrain_roll ? tilt_sigma : 1.0e6;
+        const double pitch_sigma = raw.constrain_pitch ? tilt_sigma : 1.0e6;
+        const double graph_z_sigma = raw.constrain_z ? z_sigma : 1.0e6;
+        const double graph_cross_sigma =
+            raw.constrain_cross_track ? cross_track_sigma : 1.0e6;
+        const double graph_yaw_sigma =
+            raw.constrain_yaw ? rail_yaw_sigma : 1.0e6;
+        const bool added = graph_->addRailMeasurement(
+            raw.stamp, raw.T_map_odom, raw.rail_tangent_map,
+            graph_cross_sigma, graph_z_sigma, roll_sigma, pitch_sigma,
+            graph_yaw_sigma);
+        if (added) {
+          if (const auto optimized = graph_->correctionAt(raw.stamp)) {
+            syncStateFromCorrectionLocked(*optimized);
+          }
+        } else {
+          LOG(W, "Could not attach rail factor to keyframe at " << raw.stamp
+                                                                 << ".");
+        }
+      }
+      filtered = correctionLocked();
+      filtered_covariance = vertical_covariance_;
+      planar_covariance = covariance_;
+      const bool has_confirmed_fix = status_ == Status::Tracking ||
+                                     status_ == Status::Degraded ||
+                                     status_ == Status::Lost;
+      if (has_confirmed_fix) {
+        if (graph_ && graph_->initialized()) rewriteTrajectoryFromGraphLocked();
+        else rewriteTrajectoryTailLocked(raw.stamp, filtered);
+      }
+    } else if (stats_.last_innovation_z_m <= config_.max_innovation_z_m &&
         stats_.last_innovation_tilt_deg <= config_.max_innovation_tilt_deg &&
-        mahalanobis <= config_.mahalanobis_gate) {
+        mahalanobis <= config_.rail_mahalanobis_gate) {
       if (config_.filter_enable) {
         const Eigen::Matrix3d gain =
             vertical_covariance_ * decomposition.solve(Eigen::Matrix3d::Identity());
-        vertical_state_ += gain * innovation;
-        vertical_state_.y() = wrapAngle(vertical_state_.y());
-        vertical_state_.z() = wrapAngle(vertical_state_.z());
+        const Eigen::Vector3d update = gain * innovation;
+        const double updated_roll = wrapAngle(current_rpy.x() + update.y());
+        const double updated_pitch = wrapAngle(current_rpy.y() + update.z());
+        const double updated_anchor_z = filtered_anchor_map.z() + update.x();
+        const Rotation updated_rotation =
+            rpyRotation(updated_roll, updated_pitch, current_rpy.z());
+        const V3 rotated_anchor = updated_rotation * raw.correction_anchor_odom;
+        state_.x() = filtered_anchor_map.x() - rotated_anchor.x();
+        state_.y() = filtered_anchor_map.y() - rotated_anchor.y();
+        vertical_state_.x() = updated_anchor_z - rotated_anchor.z();
+        vertical_state_.y() = updated_roll;
+        vertical_state_.z() = updated_pitch;
         const Eigen::Matrix3d residual = Eigen::Matrix3d::Identity() - gain;
         vertical_covariance_ =
             residual * vertical_covariance_ * residual.transpose() +
@@ -604,13 +815,41 @@ void PoleLocalization::addRailCorrection(
       }
       accepted = true;
       ++stats_.rail_accepted;
+      last_rail_fix_distance_m_ = raw.odom_distance_m;
+      const bool allow_rail_graph =
+          status_ == Status::Tracking || status_ == Status::Degraded ||
+          status_ == Status::Lost;
+      if (graph_ && allow_rail_graph) {
+        const double roll_sigma = raw.constrain_roll ? tilt_sigma : 1.0e6;
+        const double pitch_sigma = raw.constrain_pitch ? tilt_sigma : 1.0e6;
+        const double graph_z_sigma = raw.constrain_z ? z_sigma : 1.0e6;
+        const double graph_cross_sigma =
+            raw.constrain_cross_track ? cross_track_sigma : 1.0e6;
+        const double graph_yaw_sigma =
+            raw.constrain_yaw ? rail_yaw_sigma : 1.0e6;
+        const bool added = graph_->addRailMeasurement(
+            raw.stamp, raw.T_map_odom, raw.rail_tangent_map,
+            graph_cross_sigma, graph_z_sigma, roll_sigma, pitch_sigma,
+            graph_yaw_sigma);
+        if (added) {
+          if (const auto optimized = graph_->correctionAt(raw.stamp)) {
+            syncStateFromCorrectionLocked(*optimized);
+          }
+        } else {
+          LOG(W, "Could not attach rail factor to keyframe at " << raw.stamp
+                                                                 << ".");
+        }
+      }
       filtered = correctionLocked();
       filtered_covariance = vertical_covariance_;
       planar_covariance = covariance_;
       const bool has_confirmed_fix = status_ == Status::Tracking ||
                                      status_ == Status::Degraded ||
                                      status_ == Status::Lost;
-      if (has_confirmed_fix) rewriteTrajectoryTailLocked(raw.stamp, filtered);
+      if (has_confirmed_fix) {
+        if (graph_ && graph_->initialized()) rewriteTrajectoryFromGraphLocked();
+        else rewriteTrajectoryTailLocked(raw.stamp, filtered);
+      }
     } else {
       ++stats_.rail_rejected;
       LOG(W, "Rejected filtered rail update: innovation "
@@ -653,6 +892,7 @@ void PoleLocalization::addOdometry(uint64_t stamp, const Transform& T_odom_body)
       traveled = (T_odom_body.translation() - last_odom_position_).head<2>().norm();
     }
     have_odom_ = true;
+    latest_odom_stamp_ = stamp;
     latest_odom_ = T_odom_body;
     last_odom_position_ = T_odom_body.translation();
     odom_distance_m_ += traveled;
